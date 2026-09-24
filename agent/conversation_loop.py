@@ -1,4 +1,12 @@
-"""The agent conversation loop — extracted from ``run_agent.AIAgent``.
+"""【智能体对话循环核心引擎 / Agent Conversation Loop Core Engine】
+从原先的单体类 ``run_agent.AIAgent`` 解耦出来的核心对话轮次驱动循环。
+
+``run_conversation(agent, ...)`` 负责驱动单个用户轮次（User Turn）的完整执行闭环：
+包括模型请求装配、工具分发与并发执行、异常重试、模型级级联回退（Fallbacks）、上下文压缩触发、以及轮次结束后的各种后置钩子。
+外部测试对 ``run_agent`` 打上的猴子补丁（如 ``handle_function_call``, ``_set_interrupt``, ``OpenAI``）
+统一通过 ``_ra`` 惰性引用解析，保障测试与外部调用的完全兼容。
+
+The agent conversation loop — extracted from ``run_agent.AIAgent``.
 
 ``run_conversation(agent, ...)`` drives one user turn (model call, tool dispatch,
 retries, fallbacks, compression, post-turn hooks). Symbols that callers patch on
@@ -35,6 +43,8 @@ from agent.surface_switch import (
 )
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from agent.turn_retry_state import TurnRetryState
+# 【Turn 循环各个阶段辅助函数 / Phase helpers of the turn loop】
+# 在模块加载时直接绑定导入，确保在轮次执行中途即使源码发生热更新变动，也不会加载到错位的阶段逻辑。
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
 from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
@@ -69,6 +79,9 @@ _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
 
 
+# 【运行预算即将耗尽提醒 / Run budget wrap-up notice】
+# 当单任务运行时间预算（--run-budget）消耗超过 80% 时向模型追加的一次性收尾通知：
+# 命令模型立即停止新的探索与验证，根据当前已有信息产出最终交付成果。
 # One-time wrap-up notice appended when a wall-clock run budget (--run-budget) crosses 80%.
 RUN_BUDGET_WRAPUP_NOTICE = (
     "[SYSTEM NOTICE — run time budget nearly exhausted] Run time budget nearly exhausted. "
@@ -80,7 +93,13 @@ RUN_BUDGET_WRAPUP_NOTICE = (
 def _midturn_request_pressure_tokens(
     agent: Any, api_messages: List[Dict[str, Any]], effective_system: str, approx_tokens: int
 ) -> int:
-    """Token figure the mid-turn pre-API compression guard compares: the pruned
+    """【轮次中间请求 Token 压力精确评估】
+    在调用 API 之前预检当前上下文 Token 规模，以决定是否需要紧急触发上下文压缩：
+    如果后端支持原生 Responses 压缩检查点（Native Compaction），则直接采用裁剪后的精确估计；
+    否则使用通用的消息历史 + 工具定义估算。系统提示词只计算一次。
+    避免对已压缩的原生会话误触发长达 600 秒的不必要本地全量压缩（参见 issue #96995）。
+
+    Token figure the mid-turn pre-API compression guard compares: the pruned
     native-Responses estimate when native compaction eligibility is proven (the generic
     estimate overstates the wire on compacted sessions, #96995), else messages+tools.
     The system prompt is counted exactly once.
@@ -642,7 +661,12 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str) -> bool:
 
 
 def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool = False) -> None:
-    """Persist ``agent._cached_system_prompt`` to the session row; failures log at WARNING
+    """【持久化系统提示词至 SessionDB】
+    将 agent._cached_system_prompt 写入会话行；若失败则记录 WARNING 级别日志（附带 failure_message）。
+    在网关模式（Gateway）下，每个 Turn 都会实例化全新的 AIAgent 对象，因此必须在每次 Turn 开始时
+    从该数据库行中读取，如果此处静默写入失败，会导致后续 Turn 无法命中大模型的前缀缓存（Prefix Cache）。
+
+    Persist ``agent._cached_system_prompt`` to the session row; failures log at WARNING
     (with ``failure_message``) because the gateway path (fresh AIAgent per turn) reads
     this row every turn, so a silent failure breaks prefix-cache reuse."""
     if not agent._session_db:
@@ -657,7 +681,21 @@ def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool =
 
 
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
-    """Restore the cached system prompt from the session DB or build it fresh.
+    """【恢复或构建系统提示词 —— 前缀缓存神圣不可侵犯（Prompt Caching is Sacred）】
+    从会话数据库（SessionDB）中恢复已缓存的系统提示词，或者重新构建全新的提示词。
+    该函数会修改 agent._cached_system_prompt，并在首次构建时将其持久化到数据库中。
+    行状态分为 missing / null / empty / present 并记录日志，数据库异常会以 WARNING 记录，
+    以便在 agent.log 中清晰暴露静默的前缀缓存未命中（Cache Miss）。
+
+    核心机制：
+    1. 持续会话复用（Continuing Session）：如果数据库中存在且运行时标识（模型、供应商）匹配，
+       则逐字节（byte-for-byte）精确复用上次 Turn 的系统提示词，确保 Anthropic / OpenAI 等服务商的前缀缓存百分之百命中！
+    2. 交互界面切换（Surface Switch，例如 CLI -> Desktop）：不重构前缀！而是通过 stage_surface_switch_note
+       在请求末尾注入提示，避免破坏 token 0 处的前缀缓存（参见 issue #104414）。
+    3. 工具序列冻结（Tools Freeze）：固定 tools[] 的序列与上次发送完全一致，因为工具定义位于系统提示词前，
+       如果工具顺序改变会导致前缀缓存从第 0 个 token 开始全部失效。
+
+    Restore the cached system prompt from the session DB or build it fresh.
 
     Mutates ``agent._cached_system_prompt`` and persists a freshly-built prompt on first
     build. Row states ``missing``/``null``/``empty``/``present`` are logged and DB
@@ -1080,7 +1118,11 @@ def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool
 
 
 def _sync_failover_system_message(agent, api_messages, active_system_prompt):
-    """Refresh the in-flight system message after a provider failover: ``api_messages`` were
+    """【故障转移后同步正在处理的系统消息】
+    当主模型发生故障切换到备用模型后，刷新当前正在发送的系统消息：
+    因为 api_messages 是在故障转移前构建的，重试时需要重新同步。返回新的 active_system_prompt。
+
+    Refresh the in-flight system message after a provider failover: ``api_messages`` were
     built pre-failover and are reused each retry. Returns the new ``active_system_prompt``."""
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
@@ -1093,7 +1135,11 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
 
 
 def _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry):
-    """After a successful fallback activation: sync the system message and arm
+    """【装载故障备用重启标志】
+    当成功激活备用模型（Fallback）后：同步系统提示词并装载 restart_with_rebuilt_messages。
+    调用者还会将 retry_count / compression_attempts 清零并跳出重试循环，以全新的模型重新构建请求。
+
+    After a successful fallback activation: sync the system message and arm
     ``restart_with_rebuilt_messages``. Callers also zero ``retry_count`` /
     ``compression_attempts`` and ``break`` the retry loop."""
     active_system_prompt = _sync_failover_system_message(
@@ -1104,7 +1150,11 @@ def _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry):
 
 
 def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
-    """Rebuild ``_cached_system_prompt_static`` when caching becomes active (#72626): sessions
+    """【确保系统提示词静态前缀有效性】
+    当缓存功能激活时重新构建 _cached_system_prompt_static（参见 issue #72626）：
+    防止在未开启缓存的主模型下加载的会话，在故障转移到开启缓存的模型后退化为陈旧的无断点布局。
+
+    Rebuild ``_cached_system_prompt_static`` when caching becomes active (#72626): sessions
     restored under a cache-off primary would otherwise fall back to the legacy layout after
     failover to a cache-on provider."""
     from agent.system_prompt import reconstruct_static_prefix
@@ -1121,7 +1171,11 @@ def _redecorate_prompt_cache_for_provider(
     agent, api_messages: List[Dict[str, Any]], *, system_message=None,
     moa_prepared: Optional[Dict[str, Any]] = None, tools_for_api: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]] | tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Strip and re-apply cache_control for the *current* provider policy — failover
+    """【按目标模型服务商重新装饰 Prompt 缓存标记】
+    剥离并重新应用符合当前服务商策略的 cache_control 标记 ——
+    故障转移的 continue 路径会复用 api_messages（参见 issue #72626）。MoA 指引消息会被剥离并重新基线化。
+
+    Strip and re-apply cache_control for the *current* provider policy — failover
     ``continue`` paths reuse ``api_messages`` (#72626). MoA guidance is peeled and rebased."""
     messages: List[Dict[str, Any]] = [dict(m) if isinstance(m, dict) else m for m in (api_messages or [])]
     prepared = moa_prepared
@@ -1287,7 +1341,21 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> Dict[str, Any
 
 @dataclass
 class _LoopState:
-    """Every local the turn loop threads through the phase helpers in ``agent/turn_*.py``.
+    """【Agent Loop 核心状态容器 / Turn Loop State Dataclass】
+    这是在 2026 年 9 月重构（God-File 拆分）中引入的关键状态架构：
+    旧版代码中 run_agent.py 拥有超过 15,000 行代码，上百个局部变量在单一函数内高度耦合穿梭。
+    拆分后，agent/turn_*.py 中的各个独立阶段函数（Phase Helpers）全部通过 _LoopState 数据类
+    来解耦、传递和同步状态：
+    1. 轮次固定字段（Fixed for the turn）：user_message, turn_id, moa_config, effective_task_id 等。
+    2. 轮次级动态状态（Turn-scoped state）：messages（当前消息历史列表）、active_system_prompt、
+       interrupted（是否被用户打断）、restart_count（跨迭代重启计数器，防止重定向死循环耗尽租约）、
+       compression_attempts（上下文压缩计数器，防止无效压缩死循环）。
+    3. 单次迭代槽位（Per-iteration slots）：api_messages, tools_for_api, retry_count, finish_reason,
+       response, api_kwargs 等。
+
+    _run_phase 反射各个阶段函数的参数列表，按需注入字段，并将 Verdict 返回的结果写回 _LoopState。
+
+    Every local the turn loop threads through the phase helpers in ``agent/turn_*.py``.
 
     Helpers take the loop locals they need as keyword arguments named like these fields and
     return a verdict whose non-``action``/``result`` fields carry the same names;
@@ -1382,7 +1450,14 @@ _LATCHED_VERDICT_FIELDS = {"handle_api_error": frozenset({"_provider_overflow_re
 
 
 def _run_phase(fn, agent, state: _LoopState, **extra):
-    """Call phase helper ``fn`` with the loop locals it names, copy its verdict fields back.
+    """【执行单个循环阶段 Phase Helper】
+    调用独立的阶段处理函数 fn，依据函数签名自动从 _LoopState 中提取对应的局部变量实参；
+    执行完毕后将返回的 Verdict 中的各字段写回 _LoopState。
+    
+    extra 参数可传入非状态参数（例如捕获的异常 api_error 或 e）。
+    返回 Verdict 决策对象，以便外层循环根据 verdict.action（"continue" / "break" / "return" 等）和 verdict.result 做出控制流决策。
+
+    Call phase helper ``fn`` with the loop locals it names, copy its verdict fields back.
 
     ``extra`` supplies non-state arguments (the caught exception). Returns the verdict so
     the caller can act on ``.action`` / ``.result``."""
@@ -1403,7 +1478,16 @@ def _run_phase(fn, agent, state: _LoopState, **extra):
 
 
 def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
-    """One API call with its retry/recovery loop (guard → build → call → check, error handlers).
+    """【API 调用与重试重愈循环（Retry / Recovery Loop）】
+    单次大模型 API 调用的全套防护与重试机制：
+    1. nous_rate_limit_guard: 速率限制防熔断看门狗；
+    2. build_api_request: 构建网络请求载荷，包含缓存标记装饰与端点适配；
+    3. perform_api_call: 执行实际的流式/非流式 HTTP 传输；
+    4. check_api_response: 检验模型响应完整性（检查输出是否截断或损坏）；
+    5. handle_api_interrupt / handle_api_error: 捕获用户中断、429限流、413上下文超限、5xx服务崩溃，
+       并触发自适应退避（Adaptive Backoff）、自动压缩重试或模型故障转移（Failover）。
+
+    One API call with its retry/recovery loop (guard → build → call → check, error handlers).
 
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
@@ -1449,7 +1533,36 @@ def _run_conversation_turn(
     turn_author: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run a complete conversation with tool calling until completion; returns the result dict.
+    """【执行单轮完整对话循环（驱动多轮工具调用与推理）】
+    完整驱动单个 Turn 的生命周期，直到模型输出最终纯文本回答或达到迭代上限。
+    返回包含最终结果、用量统计及退出原因的字典。
+
+    核心参数说明：
+    - stream_callback: 文本增量流式回调函数（用于打字机流式输出、实时 Web 消息推送或 TTS 语音合成）；
+    - persist_user_message: 干净的用户消息（当 user_message 包含 API 专属合成指令或提示时，用于存入数据库的真实文本）；
+    - persist_user_timestamp / persist_user_platform_id: 消息持久化时间戳与来源平台 ID（用于排重和断点恢复）；
+    - persist_user_display_*: 仅用于 UI 前端渲染的展示元数据，模型接收到的实际消息文本不受影响；
+    - moa_config: 混合专家/模型融合（Mixture of Agents）配置。
+
+    执行流程概览：
+    1. 轮次前状态重置与 .env 凭据热重载（Per-turn setup & Env refresh）；
+    2. build_turn_context: 组装轮次上下文（恢复或构建系统提示词、安装安全 stdio 管道、触发前置压缩门禁等）；
+    3. 实例化 _LoopState 核心状态容器；
+    4. 核心迭代 while 循环（受 max_iterations 和 iteration_budget 双重限制）：
+       - Phase 1: begin_iteration（打断检查、运行预算预警、速率看门狗）
+       - Phase 2: prepare_iteration（清理单次迭代槽位、重置 Token 计数）
+       - Phase 3: assemble_api_request（装配消息历史与工具模式，应用前缀缓存装饰）
+       - Phase 4: run_preflight_gate（请求前上下文门禁检测，若超出上下文窗口触发压缩）
+       - Phase 5: announce_api_call（触发 UI 加载指示器/Thinking Spinner）
+       - Phase 6: _run_api_retry_loop（网络请求重试循环，包含 429 退避、413 自动压缩恢复与故障转移）
+       - Phase 7: apply_retry_restarts（应用重试重启，如重定向或故障转移后的消息重建）
+       - Phase 8: normalize_model_response（标准化解析大模型响应，提取思考链、文本内容与工具调用对象）
+       - Phase 9: 分支执行：
+         - 若有工具调用 -> run_tool_round（通过 SegmentPlanner 执行分段并行或串行工具调用，回写 tool 响应消息）
+         - 无工具调用 -> finish_text_response（完成文本回复，准备退出循环）
+    5. finalize_turn: 轮次收尾（持久化增量消息至 SessionDB、检查内存同步不变量、异步派发记忆沉淀后台审核任务）。
+
+    Run a complete conversation with tool calling until completion; returns the result dict.
 
     ``stream_callback``: per-text-delta callback (TTS). ``persist_user_message``: clean text to
     store when ``user_message`` carries API-only synthetic prefixes; timestamp / platform id are
@@ -1606,7 +1719,15 @@ def run_conversation(
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
+    """【执行单轮对话并稳定导出轮次消息边界】
+    本模块的公开入口函数：调用内部驱动函数 _run_conversation_turn，
+    并通过 export_current_turn_boundary 导出该轮次的精确消息边界。
+
+    无论轮次因何种状态退出（执行成功、部分错误、用户打断、重试耗尽、工具调用次数超限、前置压缩超时或 Codex 专属运行时），
+    都会经由此处返回，确保 {turn_id, current_turn_user_idx} 准确锚定在所处理的 messages 历史列表旁，
+    尤其是在经历过后置微压缩（Micro-compaction）等历史重写之后，仍能保证消息索引与外部会话视图的一致性。
+
+    Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
 
     Every envelope that leaves the loop — success, partial/error, interrupt, retry-exhausted,
     tool-limit, preflight timeout, codex runtime — passes through here, so the
