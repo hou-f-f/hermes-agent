@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Hermes Agent Loop 交互式架构可视化</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    .step-btn.active {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.25);
+    }
+    .flow-line {
+      background: linear-gradient(90deg, #6366f1, #06b6d4, #10b981, #f59e0b, #ec4899);
+    }
+  </style>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-3">
+  <div class="bg-[var(--card)] text-[var(--foreground)] border border-[var(--border)] rounded-2xl p-5 shadow-lg max-w-4xl mx-auto backdrop-blur-sm">
+    
+    <!-- 头部标题与徽章 -->
+    <div class="flex items-center justify-between border-b border-[var(--border)] pb-4 mb-4">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 to-cyan-400 flex items-center justify-center text-white font-bold text-xl shadow-md">
+          ⚡
+        </div>
+        <div>
+          <h2 class="text-[var(--foreground)] font-bold text-lg flex items-center gap-2">
+            Hermes Agent Loop 现代架构流转全景
+            <span class="text-xs px-2.5 py-0.5 rounded-full font-medium bg-emerald-500/10 text-emerald-500 border border-emerald-500/20">2026.9+ 最新拓扑</span>
+          </h2>
+          <p class="text-[var(--muted-foreground)] text-xs">点击下方流水线节点，沉浸式探索各阶段核心控制逻辑与设计不变量</p>
+        </div>
+      </div>
+      <div class="text-xs text-[var(--muted-foreground)] bg-[var(--background)] px-3 py-1.5 rounded-lg border border-[var(--border)]">
+        状态机: <span class="font-mono text-indigo-400 font-semibold">_LoopState</span>
+      </div>
+    </div>
+
+    <!-- 交互式流水线进度条 -->
+    <div class="relative mb-5">
+      <div class="h-1.5 w-full bg-[var(--border)] rounded-full overflow-hidden mb-3">
+        <div id="progressBar" class="flow-line h-full transition-all duration-300 w-1/5"></div>
+      </div>
+      <div class="grid grid-cols-5 gap-2 text-center" id="pipelineNav">
+        <button onclick="switchStage(0)" class="step-btn active transition-all p-2 rounded-xl border border-indigo-500/40 bg-indigo-500/10 hover:bg-indigo-500/20 flex flex-col items-center">
+          <span class="text-xs font-bold text-indigo-400">1. 准入门禁</span>
+          <span class="text-[10px] text-[var(--muted-foreground)]">Turn Lease 租约</span>
+        </button>
+        <button onclick="switchStage(1)" class="step-btn transition-all p-2 rounded-xl border border-[var(--border)] bg-[var(--background)] hover:border-cyan-500/50 flex flex-col items-center">
+          <span class="text-xs font-bold text-cyan-400">2. 状态机就绪</span>
+          <span class="text-[10px] text-[var(--muted-foreground)]">Prompt 缓存保活</span>
+        </button>
+        <button onclick="switchStage(2)" class="step-btn transition-all p-2 rounded-xl border border-[var(--border)] bg-[var(--background)] hover:border-amber-500/50 flex flex-col items-center">
+          <span class="text-xs font-bold text-amber-400">3. API 调用与重试</span>
+          <span class="text-[10px] text-[var(--muted-foreground)]">429/413 自愈重愈</span>
+        </button>
+        <button onclick="switchStage(3)" class="step-btn transition-all p-2 rounded-xl border border-[var(--border)] bg-[var(--background)] hover:border-purple-500/50 flex flex-col items-center">
+          <span class="text-xs font-bold text-purple-400">4. 工具分段执行</span>
+          <span class="text-[10px] text-[var(--muted-foreground)]">SegmentPlanner</span>
+        </button>
+        <button onclick="switchStage(4)" class="step-btn transition-all p-2 rounded-xl border border-[var(--border)] bg-[var(--background)] hover:border-emerald-500/50 flex flex-col items-center">
+          <span class="text-xs font-bold text-emerald-400">5. 持久化收尾</span>
+          <span class="text-[10px] text-[var(--muted-foreground)]">记忆安全守卫</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 动态详情展示卡片 -->
+    <div id="stageDetail" class="rounded-xl p-4 border transition-all duration-200">
+      <!-- JS 动态注入 -->
+    </div>
+
+    <!-- 底部操作与导航 -->
+    <div class="flex items-center justify-between mt-4 pt-3 border-t border-[var(--border)] text-xs text-[var(--muted-foreground)]">
+      <div class="flex items-center space-x-2">
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+        <span>代码对齐: <code class="text-indigo-400 font-mono">agent/conversation_loop.py</code></span>
+      </div>
+      <div class="flex space-x-2">
+        <button onclick="prevStage()" class="px-3 py-1.5 rounded-lg border border-[var(--border)] bg-[var(--background)] hover:bg-[var(--border)] transition-colors">◀ 上一阶段</button>
+        <button onclick="nextStage()" class="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium transition-colors shadow">下一阶段 ▶</button>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const stages = [
+      {
+        title: "🛡️ 阶段 1：准入门禁与租约层 (Gatekeeper & Turn Lease)",
+        location: "run_agent.py ➔ agent/turn_facade.py",
+        colorClass: "border-indigo-500/30 bg-indigo-500/5",
+        badge: "Durable Multi-Process Turn Lease",
+        badgeColor: "bg-indigo-500/20 text-indigo-400 border-indigo-500/30",
+        desc: "防止多端并发冲突的核心护城河。当用户同时通过 CLI、Gateway、TUI 或 Desktop 投递消息时：",
+        points: [
+          "<b>admit_durable_turn_lease</b>：在数据库底层为当前 session_id 获取全局排他执行租约，杜绝多进程写入交叉损坏。",
+          "<b>活跃度看门狗 (Liveness Watchdog)</b>：后台心跳维系租约有效性；若宿主进程意外崩溃，租约自动超时熔断回收。",
+          "<b>前置打断判定</b>：在进入 API 循环前校验取消信号，若已被打断则执行零成本安全退出。"
+        ],
+        invariant: "⚠️ 不变量：绝对禁止单会话无租约并行执行两个轮次。"
+      },
+      {
+        title: "⚙️ 阶段 2：状态机初始化与 Prompt 缓存恢复",
+        location: "agent/conversation_loop.py ➔ agent/turn_context.py",
+        colorClass: "border-cyan-500/30 bg-cyan-500/5",
+        badge: "Prompt Caching is Sacred",
+        badgeColor: "bg-cyan-500/20 text-cyan-400 border-cyan-500/30",
+        desc: "极速恢复上下文，维护大模型前缀缓存 100% 命中的核心阶段：",
+        points: [
+          "<b>_restore_or_build_system_prompt</b>：持续会话直接从 SessionDB 提取上一轮系统提示词，逐字节完全一致地复用。",
+          "<b>工具列表严格冻结 (Tools Pinning)</b>：调用 restore_agent_tool_prefix 锁定 tools[] 的参数与顺序，防止工具顺序抖动导致前缀缓存失效。",
+          "<b>交互界面切换 (Surface Switch)</b>：若客户端从 CLI 切换至 Desktop，不修改头部 Prompt，而是在请求末尾追加 stage_surface_switch_note。",
+          "<b>_LoopState 容器化</b>：将 turn_id、messages、active_system_prompt、restart_count 等状态封装，备战 9 阶段主循环。"
+        ],
+        invariant: "💎 不变量：长会话生命周期内，System Prompt 字节序列神圣不可变，除非显式触发 Context Compression。"
+      },
+      {
+        title: "🌐 阶段 3：API 组装、上下文门禁与自适应重试",
+        location: "agent/conversation_loop.py ➔ agent/turn_phase_api.py",
+        colorClass: "border-amber-500/30 bg-amber-500/5",
+        badge: "Adaptive Healing & Failover",
+        badgeColor: "bg-amber-500/20 text-amber-400 border-amber-500/30",
+        desc: "单次大模型 API 交互的全生命周期闭环管控与自愈恢复：",
+        points: [
+          "<b>Phase 1~4 (预检与装配)</b>：速率看门狗探测 ➔ 槽位清理 ➔ 缓存标记装饰 ➔ 上下文预检门禁（超限自动触发有损压缩摘要）。",
+          "<b>Phase 5~6 (_run_api_retry_loop)</b>：触发 UI Thinking Spinner ➔ 发起可中断网络请求 ➔ 校验响应完整性。",
+          "<b>异常重愈闭环</b>：遇 429 启动指数退避；遇 413 自动启动在位就地压缩重试；遇 5xx/401 自动激活备用 Provider 并重载系统提示词。",
+          "<b>Phase 7~8 (标准化解析)</b>：将 OpenAI / Anthropic / Codex 的异构返回标准化抽取为 content、reasoning 与 tool_calls。"
+        ],
+        invariant: "🛡️ 不变量：所有 Provider 最终收敛为标准的 OpenAI 消息字典结构，思考链严格隔离在 reasoning 字段。"
+      },
+      {
+        title: "⚡ 阶段 4：工具分段规划与安全执行 (SegmentPlanner)",
+        location: "agent/turn_tool_round.py ➔ tools/registry.py",
+        colorClass: "border-purple-500/30 bg-purple-500/5",
+        badge: "SegmentPlanner Concurrency",
+        badgeColor: "bg-purple-500/20 text-purple-400 border-purple-500/30",
+        desc: "告别无脑并发，实现安全确定性的现代工具调度引擎：",
+        points: [
+          "<b>分段并发规划</b>：将模型产出的多个 tool_calls 分解为『只读并发段 (Parallel Safe)』与『串行屏障段 (Barrier)』。",
+          "<b>高危命令审批</b>：针对 rm -rf、写文件或环境变更高危动作，触发 approval_callback 阻塞等待用户确认。",
+          "<b>确定性 ID 碰撞消解</b>：多个工具若 ID 冲突，使用 _d1, _d2 确定性后缀消解（严禁使用 uuid4 以保住 Prompt 缓存）。",
+          "<b>后置微压缩 (Micro-compaction)</b>：超长工具输出（如大文件或大日志）就地修剪压缩，将结果追加到 messages 列表。"
+        ],
+        invariant: "⚡ 不变量：存在写入副作用与交互式工具（如 clarify）必须作为并发屏障，强制顺序同步执行。"
+      },
+      {
+        title: "💾 阶段 5：持久化收尾与记忆安全守卫",
+        location: "agent/turn_finalizer.py ➔ hermes_state.py",
+        colorClass: "border-emerald-500/30 bg-emerald-500/5",
+        badge: "Memory Sync Invariant",
+        badgeColor: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
+        desc: "保证会话数据完整、会话断点可续跑与长期知识库纯净的收官阶段：",
+        points: [
+          "<b>SQLite 增量持久化</b>：将本轮交互生成的新消息、耗时、Token 计费与退出原因安全写入 SessionDB。",
+          "<b>Memory Sync Invariant 守卫</b>：若当前轮次被用户打断（interrupted=True），绝对禁止向外部向量记忆（Mem0/Zep）同步（Issue #15218）。",
+          "<b>后台记忆沉淀 (Review Spawning)</b>：若满足长期经验沉淀条件，异步派发子 Agent 分析对话并提炼至 MEMORY.md。",
+          "<b>精准边界导出</b>：通过 export_current_turn_boundary 导出 {turn_id, current_turn_user_idx}。"
+        ],
+        invariant: "🔒 不变量：被打断或不完整的轮次绝不污染长期记忆库，确保未来检索的上下文纯度。"
+      }
+    ];
+
+    let currentIdx = 0;
+
+    function renderStage(idx) {
+      const stage = stages[idx];
+      const container = document.getElementById("stageDetail");
+      container.className = `rounded-xl p-4 border transition-all duration-200 ${stage.colorClass}`;
+      
+      let pointsHtml = stage.points.map(p => `
+        <li class="flex items-start space-x-2 text-xs text-[var(--foreground)]">
+          <span class="text-indigo-400 mt-0.5">•</span>
+          <span>${p}</span>
+        </li>
+      `).join('');
+
+      container.innerHTML = `
+        <div class="flex items-center justify-between mb-3">
+          <div class="font-bold text-sm text-[var(--foreground)]">${stage.title}</div>
+          <span class="text-[10px] px-2 py-0.5 rounded-full font-semibold border ${stage.badgeColor}">${stage.badge}</span>
+        </div>
+        <div class="text-[11px] text-[var(--muted-foreground)] font-mono mb-2">📍 核心路径: ${stage.location}</div>
+        <p class="text-xs text-[var(--muted-foreground)] mb-3 leading-relaxed">${stage.desc}</p>
+        <ul class="space-y-2 mb-3 bg-[var(--background)]/60 p-3 rounded-lg border border-[var(--border)]">
+          ${pointsHtml}
+        </ul>
+        <div class="text-[11px] font-medium text-amber-400/90 bg-amber-500/10 p-2 rounded-md border border-amber-500/20">
+          ${stage.invariant}
+        </div>
+      `;
+
+      // Update Nav buttons
+      const buttons = document.querySelectorAll("#pipelineNav .step-btn");
+      buttons.forEach((btn, i) => {
+        if (i === idx) {
+          btn.classList.add("active", "border-indigo-500/60", "bg-indigo-500/15");
+          btn.classList.remove("border-[var(--border)]", "bg-[var(--background)]");
+        } else {
+          btn.classList.remove("active", "border-indigo-500/60", "bg-indigo-500/15");
+          btn.classList.add("border-[var(--border)]", "bg-[var(--background)]");
+        }
+      });
+
+      // Update progress bar
+      const percent = ((idx + 1) / stages.length) * 100;
+      document.getElementById("progressBar").style.width = percent + "%";
+    }
+
+    function switchStage(idx) {
+      currentIdx = idx;
+      renderStage(currentIdx);
+    }
+
+    function nextStage() {
+      currentIdx = (currentIdx + 1) % stages.length;
+      renderStage(currentIdx);
+    }
+
+    function prevStage() {
+      currentIdx = (currentIdx - 1 + stages.length) % stages.length;
+      renderStage(currentIdx);
+    }
+
+    // 初始化渲染第一阶段
+    renderStage(0);
+  </script>
+</body>
+</html>
