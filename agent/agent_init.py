@@ -2352,6 +2352,13 @@ def init_agent(
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
 ):
+    """【智能体初始化总装管线 / AIAgent Init Orchestrator】
+    `init_agent` 是 AIAgent.__init__ 的具体实现。
+    它是一个薄层但顺序严谨的编排中枢，依次调度各阶段子函数：
+    路由与提供商解析 → 回调函数挂载 → HTTP Client 与连接池装配 → 工具集加载 → 会话状态初始化 →
+    配置项合并 → 记忆管理器初始化 → 上下文压缩器（Context Compressor）装配与上下文窗口协商。
+    ⚠️ 阶段顺序具有绝对结构承重性（Phase ORDER is load-bearing）：后序阶段会依赖前序阶段设置的实例属性。
+    """
     _install_safe_stdio()
 
     _params = locals()
@@ -2360,16 +2367,20 @@ def init_agent(
     for _name in _GATEWAY_IDENTITY_PARAMS:
         setattr(agent, f"_{_name}", _params[_name])
     agent.session_cwd = cwd or None
+    # 共享迭代预算：父 Agent 创建，派生的子 Agent 自动继承共享配额。
     # Shared iteration budget: parent creates, children inherit.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+    # CLI 会将其替换为 _cprint，以便原始 ANSI 状态行通过 prompt_toolkit 渲染器输出（避免 StdoutProxy 弄乱格式）。None 表示使用内置 print。
     # CLI replaces this with _cprint so raw ANSI status lines go through prompt_toolkit's
     # renderer (StdoutProxy would mangle them). None = builtins.print.
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
+    # 跳过轮次结束时的后台审查分支（每次触发约消耗 3 万 Token）；单一开关统管记忆与技能两条审查路径。
     # Skips the end-of-turn review fork (~30K tokens/event); one switch for both review paths.
     agent.skip_background_review = bool(skip_background_review)
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
+    # 计算用于特性检测（提示词缓存、推理能力支持等）的有效基础 URL
     # Effective base URL for feature detection (prompt caching, reasoning, etc.)
     from hermes_cli.providers import is_actual_route
     if is_actual_route(provider, base_url):
@@ -2400,11 +2411,13 @@ def init_agent(
 
     _set_defaults(agent, _CONTROL_STATE)
 
+    # reasoning_content 回显开关；switch_model / fallback / restore 保持其同步。
     # reasoning_content echo opt-in; switch_model / fallback / restore keep it in sync.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
+    # 记录本会话中拒绝接收图片内容的每一个 (provider, model) 组合。build_api_request 仅在向这些特定模型发请求时剥离图片，持久化历史仍完整保留。
     # Every (provider, model) that rejected image content this session. build_api_request strips
     # images from requests to those models only, so history keeps them for any model that can see.
     agent._image_rejecting_models = set()

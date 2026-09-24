@@ -71,10 +71,15 @@ from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
 
+# 【陈旧工具调用标记正则】
+# 必须与 hermes_state.py 中的 _STALE_TOOL_CALL_MARKER_RE 保持严格镜像一致；
+# 此处保持局部定义，避免在模块加载阶段强制导入 hermes_state 触发模块级 DEFAULT_DB_PATH 初始化。
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py; kept local so importing
 # hermes_state (module-level DEFAULT_DB_PATH) is not forced at load time.
 _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 
+# 【打断脚手架消息标记】
+# 由 _apply_active_turn_redirect 与 api_messages 幽灵行过滤器共享，防止两处定义产生漂移。
 # Shared by _apply_active_turn_redirect and the api_messages ghost-row filter so both sites cannot drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
 
@@ -348,7 +353,10 @@ def _moa_client_consumes_prepared_request(client: Any) -> bool:
 
 
 def _join_truncated_parts(parts: List[str]) -> str:
-    """Join continuation fragments, adding a newline where two would glue together (#78577)."""
+    """【智能拼接截断的回复文本块】
+    连接因超长截断而分批生成的连续片段：当相邻两个片段未以空白字符相接时，自动补入换行符避免文字粘连（参见 issue #78577）。
+
+    Join continuation fragments, adding a newline where two would glue together (#78577)."""
     joined = ""
     for part in parts:
         if joined and not joined[-1].isspace() and part and not part[0].isspace():
@@ -358,7 +366,11 @@ def _join_truncated_parts(parts: List[str]) -> str:
 
 
 def _moa_reference_metrics_for_hook(agent: Any) -> Any:
-    """Per-advisor metrics for post_api_request, or None off the MoA path (a plugin only
+    """【提取 MoA 混合专家参考顾问用量指标】
+    供 post_api_request 钩子使用：普通插件通常只能看到聚合模型（Aggregator）的生成用量；
+    本函数提取底层每个顾问槽位（Per-slot advisor）的细分 Token 消耗开销，若非 MoA 路径则返回 None。
+
+    Per-advisor metrics for post_api_request, or None off the MoA path (a plugin only
     sees the aggregator generation; this carries the per-slot advisor spend)."""
     client = getattr(agent, "client", None)
     getter = getattr(client, "last_reference_metrics", None)
@@ -404,6 +416,10 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     checkpoint = "\n\n".join(checkpoint_parts)
     correction = f"[Context from the interrupted assistant response]\n{checkpoint}\n\n{text}"
 
+    # 【角色严格交替与打断脚手架设计】
+    # 活跃历史的末尾通常是 user 或 tool，因此通过 [assistant 占位符 + user 纠偏] 保持严格交替（User -> Assistant -> User）；
+    # 若末尾已经是 assistant，则将检查点直接折叠进新的 user 纠偏中，避免产生连续两条 assistant。
+    # assistant 占位符纯粹用于维持交替性——脚手架标记绝不能落入占位符中，因为 api_content 在回放时会被替换回 content（参见 issue #81841）。
     # The live tail is normally user or tool, so an assistant placeholder + correction
     # keeps strict alternation; if the tail is already assistant, the checkpoint is folded
     # into the user correction instead of creating assistant→assistant. The placeholder
@@ -413,15 +429,24 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         placeholder: Dict[str, Any] = {"role": "assistant", "content": visible or ""}
         if not visible:
             placeholder["display_kind"] = "hidden"
+            # 【隐藏占位符行但赋予非空中立 api_content】
+            # 设置中立的 api_content，防止调用前的清理器在每次请求时反复尝试修复该空行（参见 issue #88955）。
+            # 绝对不能使用 _INTERRUPT_SCAFFOLD_MARKER：否则作为 assistant 文本模型会产生回读复述（参见 issue #81841）。
             # Hidden row, but a non-empty neutral api_content so the pre-call sanitizer
             # does not re-heal it every call (#88955). Never _INTERRUPT_SCAFFOLD_MARKER:
             # as assistant text the model echoes it (#81841).
             from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
             placeholder["api_content"] = _INTERRUPTED_PLACEHOLDER
         append_message(messages, placeholder)
+    # 【用户侧展示与服务商回放解耦】
+    # 本地 transcript 记录展示用户键入的真实文本；模型 API 则回放带有纠偏脚手架的结构化文本。
     # Transcript shows the user's own words; the provider replays the scaffolded form.
     append_message(messages, {"role": "user", "content": text, "api_content": correction})
 
+    # 【跨流式分块（Stream Deltas）的状态化清洗器】
+    # 解决 <memory-context> 与 <think> 标签跨 delta 分块被截断的经典痛点（参见 issue #5719 与 #17924）：
+    # 单纯的正则替换无法应对跨 chunk 边界（例如 MiniMax 在 delta1 输出 '<think>'，在 delta2 输出 'Let me check'——
+    # 原先的正则单块擦除导致 delta1 丢失，下游状态机未能识别思考块已开启，导致 delta2 泄露为正文内容）。
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.
     # Stateful scrubber for reasoning/thinking tags in streamed deltas (#17924). Replaces the per-delta
@@ -1012,6 +1037,9 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
                         return candidate[len(prefix):].strip()
         return ""
 
+    # 【模型/供应商一致性校验与工作目录（CWD）漂移检测】
+    # 工作目录（CWD）改变属于真正的物理内容变更（上下文文件、工作区快照及代码风格均基于 CWD 解析），
+    # 因此 CWD 改变必须触发系统提示词重建；而客户端界面（Surface）切换则不需要（由 agent/surface_switch.py 处理）。
     # Model/provider identity, then cwd drift.  A cwd change is a real content change (context
     # files, the workspace snapshot and the coding posture are all resolved from it), so it
     # still rebuilds; the runtime surface does not (agent/surface_switch.py).
@@ -1020,17 +1048,25 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
         current = str(getattr(agent, attr, "") or "").strip()
         if stored and current and stored != current:
             return False
+    # 【与 resolve_agent_cwd() 解析器进行一致性比对】
+    # 必须使用与当初构建系统提示词完全相同的解析器，避免 TERMINAL_CWD 会话被错误拒绝。
     # Compare against resolve_agent_cwd() — the SAME resolver used to build the
     # prompt — so TERMINAL_CWD sessions are not falsely rejected.
     stored_cwd = host_info_value("Current working directory")
     if stored_cwd and stored_cwd != str(resolve_agent_cwd()):
         return False
+    # 【平台（Platform）故意不作为身份标识字段：捍卫前缀缓存神圣不可侵犯】
+    # 客户端界面切换（如 CLI -> Desktop）绝不使已持久化的字节缓存失效，它仅仅导致接口描述小节过时；
+    # 系统通过 stage_surface_switch_note 在请求尾部注入注记进行动态纠正，绝不触碰 token 0 处的缓存前缀（参见 issue #104414）。
     # Platform is deliberately NOT an identity field: a surface switch does not invalidate the
     # stored bytes, it only makes their interface section out of date, and that is corrected by
     # agent.surface_switch.stage_surface_switch_note without touching the cached prefix (#104414).
     return True
 
 
+# 【网络错误中断续写固定标记 / Network Error Mid-stream Continuation Stub】
+# 命名与内容固定：以便 _is_synthetic_compression_user_turn 能够通过纯文本内容直接识别出
+# 因进程崩溃而意外落盘的合成续写请求（因为 SessionDB 投影会剥离内部的 _length_continuation_nudge 标签）。
 # Named so _is_synthetic_compression_user_turn can recognize a crash-persisted nudge by
 # content (SessionDB projection strips the _length_continuation_nudge tag).
 _LENGTH_CONTINUATION_NETWORK_STUB = (
@@ -1041,6 +1077,8 @@ _LENGTH_CONTINUATION_OUTPUT_LIMIT = (
     "[System: Your previous response was truncated by the output length limit. Continue exactly "
     "where you left off. Do not restart or repeat prior text. Finish the answer directly.]"
 )
+# 【大体量工具调用丢弃续写前缀 / Dropped Large Tools Continuation Prefix】
+# 当大工具调用参数过大导致流式传输超时被丢弃时，插值嵌入工具名称的前缀模板（通过前缀匹配识别）。
 # The dropped-tools variant interpolates tool names; matched by prefix.
 _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
 
@@ -1075,12 +1113,17 @@ _CODEX_INCOMPLETE_NUDGE = (
 )
 
 
+# 【仅确认消息（Ack-only）的继续推动提示词 / Codex Acknowledgment Continuation Nudge】
+# 当推理模型仅吐出无意义的口头确认（如“好的我明白了”）而未执行具体操作时，命令模型立即执行所需工具调用。
 # Re-prompt after an acknowledgment-only Codex/Responses reply.
 _CODEX_ACK_CONTINUATION_NUDGE = (
     "[System: Continue now. Execute the required tool calls and only send your final answer "
     "after completing the task.]"
 )
 
+# 【严重退化残片最终回复提示词 / Degenerate Final Fragment Nudge】
+# 机制与权衡（参见 issue #103483）：当模型在执行了真实的工具工作后，意外吐出退化的文本碎片（如标点或单个词）结束了轮次；
+# 提示词要求模型继续完成任务并输出完整回答；若该残片确系完整回答则允许原样复送，误报代价仅为多消耗一次 API 调用，绝不丢失真实答案。
 # Re-prompt after a collapsed fragment ended a turn that had done real tool work (#103483). Asks
 # for the same answer again when it WAS complete, so a false positive costs one call, never the answer.
 _DEGENERATE_FINAL_NUDGE = (
@@ -1089,12 +1132,18 @@ _DEGENERATE_FINAL_NUDGE = (
     "WAS your complete answer, send it again exactly as before.]"
 )
 
+# 【丢失工具调用声明修复提示词 / Dropped Tool Call Nudge】
+# 当大模型返回 finish_reason="tool_calls" 但并未附带具体的 tool_calls 内容时（通常由重试中途被打断导致），
+# 提示模型不要只是叙述计划，现在立即发起真实的工具调用。
 # Re-prompt for finish_reason="tool_calls" with empty tool_calls (an interrupt mid-retry can persist it).
 _DROPPED_TOOLCALL_NUDGE_CONTENT = (
     "Your previous turn indicated a tool call but none was included. Do not narrate a plan or "
     "restate intent — issue the actual tool call now to continue the task."
 )
 
+# 【工具执行后空回复提醒提示词 / Empty Response After Tool Nudge】
+# 机制背景（参见 issue #9400）：大模型刚执行完工具调用却返回了空文本；
+# 由于元数据标签在 SessionDB 投影时会被剥离，因此通过固定文本内容进行排重与匹配识别。
 # Re-prompt for an empty response after tool calls (#9400); the metadata flag does not
 # survive SessionDB projection, so it is matched by content.
 _EMPTY_TOOL_RESPONSE_NUDGE = (
@@ -1105,6 +1154,11 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 
 
 
+# 【API 发送路径工具调用参数规范化内存缓存池 / Send-path Canonicalization LRU Cache】
+# 性能考量：在每轮迭代中重新规范化所有历史工具调用的 JSON 格式。
+# 由于工具参数规范化是纯函数操作，且非法字符串在存储前直接抛出异常，因此重试回退逻辑绝不会被误缓存。
+# 设定 32MB 内存预算硬顶（_CANON_ARGS_CACHE_MAX_BYTES），因为大工具参数字符串可能达到 100KB+，
+# 单纯靠条目数量上限无法有效约束物理内存。
 # Memo for send-path tool-call argument canonicalization (re-run on every historical call
 # each iteration). Sound because canonicalization is pure; malformed strings raise before
 # being stored, so the repair fallback is never memoized. The byte budget exists because
@@ -1655,6 +1709,9 @@ class _LoopState:
     active_system_prompt: Any
     current_turn_user_idx: Any
     _preflight_compression_blocked: Any
+    # 【最大连续无效压缩限制兜底】
+    # 由 pre-API 门禁、413 异常处理与工具执行后微压缩共享的计数上限；
+    # 属于连续无效压缩重试的硬兜底，仅当模型返回的 prompt token 确认降至阈值之下时才被重新布防。
     # Compression attempt cap shared by the pre-API gate, 413 handlers and post-tool compaction:
     # a consecutive-ineffective-attempt backstop, rearmed only after a provider response
     # reports a prompt below threshold.
@@ -1665,6 +1722,10 @@ class _LoopState:
     failed: bool = False
     codex_ack_continuations: int = 0
     length_continue_retries: int = 0
+    # 【单轮次重启防死循环退避硬顶】
+    # 针对带预算返还的重启机制（如打断重定向、故障转移请求重建）。
+    # 与 retry_count（每次迭代重置为 0）不同，restart_count 在整个用户 Turn 期间单向累加，
+    # 彻底杜绝恶意重定向不断重新布防重启标志、无限返还迭代预算并永久霸占轮次租约（Turn Lease）的安全隐患。
     # Per-turn backstop for the refunding restarts (redirect / rebuilt-for-fallback).
     # Unlike ``retry_count`` (rebound to 0 each iteration) this accumulates for the whole
     # turn so a runaway interrupt/redirect that keeps re-arming a restart flag cannot
@@ -1675,18 +1736,27 @@ class _LoopState:
     truncated_response_parts: List[str] = field(default_factory=list)
     compression_attempts: int = 0
     _last_preflight_pressure: Optional[int] = None
+    # 【服务商上下文溢出恢复挂起标志】
+    # 服务商报错 413 溢出比本地粗略估算更具权威性，在压缩后覆盖粗略估算，保持挂起直到重建后的请求确实低于阈值。
     # A provider overflow outweighs the rough-estimate calibration that defers preflight after
     # compaction: stays armed until the rebuilt request is below the threshold.
     _provider_overflow_recovery_pending: bool = False
+    # 【压缩宿主超时终态耗尽标志】
+    # 压缩超时终结了轮次，收尾时复用网关上下文恢复契约（error/partial/compression_exhausted，参见 issue #98722）。
     # A compression host-timeout ended the turn; finalize reuses the gateway context-recovery
     # contract (error/partial/compression_exhausted) (#98722).
     _compression_timeout_exhausted: bool = False
     _turn_exit_reason: str = "unknown"  # diagnostic: why the loop ended
+    # 【验证门禁拦截的待定响应与流式预览状态】
+    # 当校验门禁拦截模型回答时保留最佳候选（若后续续写耗尽预算，以此作为对用户最友好的输出）；
+    # _response_was_previewed 仅当该候选最终被采纳为正文时才被置位（参见 issue #65919）。
     # Answer held back by a verification gate (best user-facing result if the continuation
     # exhausts the budget) and whether it was streamed as interim; ``_response_was_previewed``
     # is set ONLY if it becomes the final response (#65919).
     _pending_verification_response: Any = None
     _pending_verification_response_previewed: bool = False
+    # 【跨 pre-API 压缩保留的 MoA 预备请求】
+    # 在 API 前压缩后跨迭代重新基线化（无需触发第二次模型扇出）。
     # MoA guidance retained across a pre-API compression, rebased next iteration (no second fan-out).
     pending_moa_prepared_request: Any = None
     # Per-iteration slots.
@@ -1712,14 +1782,18 @@ class _LoopState:
     assistant_message: Any = None
 
 
+# 【从 TurnContext 继承初始化的 _LoopState 字段集合（字段名完全一致，仅去掉前导下划线）】
 # _LoopState fields seeded from TurnContext (same name minus the leading underscore).
 _CTX_FIELDS = frozenset({
     "user_message", "original_user_message", "conversation_history", "effective_task_id", "turn_id",
     "_should_review_memory", "_plugin_user_context", "_ext_prefetch_cache", "messages",
     "active_system_prompt", "current_turn_user_idx", "_preflight_compression_blocked",
 })
+# 【每个阶段辅助函数需要的关键字参数名缓存表（排除 agent 参数），按函数对象缓存】
 # Keyword names each phase helper takes (minus ``agent``), cached per function object.
 _PHASE_PARAMS: Dict[Any, tuple] = {}
+# 【循环锁存（只置 True 不重置）的决策字段集合】
+# 例如 handle_api_error 每次调用汇报溢出恢复状态，绝不能意外清除早先已布防的标志。
 # Verdict fields the loop latches (only ever sets True) instead of copying back:
 # ``handle_api_error`` reports overflow recovery per call and must not clear an earlier arm.
 _LATCHED_VERDICT_FIELDS = {"handle_api_error": frozenset({"_provider_overflow_recovery_pending"})}
@@ -1849,12 +1923,18 @@ def _run_conversation_turn(
             user_message, persist_user_message
         )
 
+    # 【防止缓存 Agent 跨轮次泄漏压缩状态】
+    # 网关层会在多次轮次中缓存并复用同一个 agent 实例；但压缩状态属于单轮生命周期，
+    # 否则残留的原地压缩边界会导致后续未压缩的结果被误判为已压缩。
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
     begin_fast_mode_turn(agent, conversation_history)
 
+    # 【热重载 ~/.hermes/.env 凭据与 base_url 变更】
+    # 用户在设置界面保存会更新 .env 文件，但后台运行的 worker 客户端并不会自动感知（参见 issue #67821）。
+    # 在每轮启动时尝试重新从 .env 刷新凭据，若无变动则为 no-op。
     # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a
     # Settings save updates .env, not this worker's client (#67821). No-op if unchanged.
     try:
@@ -1878,6 +1958,8 @@ def _run_conversation_turn(
             set_session_context=set_session_context,
             set_current_write_origin=set_current_write_origin,
             ra=_ra,
+            # 【MoA 混合专家请求剥离静态 sidecar 限制】
+            # MoA 轮次在每次调用时会向用户消息的 API 副本动态追加聚合上下文，因此无法标记字节级固定的 api_content 边车。
             # MoA turns append per-call aggregated context to the API copy of the
             # user message, so no byte-stable api_content sidecar can be stamped.
             moa_active=bool(moa_config),
@@ -1885,6 +1967,14 @@ def _run_conversation_turn(
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
 
+    # 【重置单轮次专属 Agent 运行状态（防止网关跨轮次缓存泄露）】
+    # 网关层会跨轮次缓存 agent 实例，因此以下状态绝不能泄露给下一个用户请求：
+    # 1. interim-commentary 临时过程评述去重集合仅覆盖本轮；
+    # 2. SessionDB 追加持久化失败标记仅阻断本轮；
+    # 3. 压缩建议采纳失败仅汇报于当前轮次；
+    # 4. 纯思考截断的一次性处理绝不能在被打断的轮次中残存；
+    # 5. 凭据池刷新计数限制相同条目在持续 401 下的无限制刷新（参见 issue #26080）；
+    # 6. on_turn_complete() 钩子所需的 usage 在未获得响应的轮次中保持为 None。
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
     # leak into the next message): interim-commentary dedup spans the whole turn but not
     # the next; a SessionDB append failure (and its classified cause) halts only this turn;
@@ -1905,6 +1995,8 @@ def _run_conversation_turn(
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
+    # 【可选运行时：Codex App-Server 子进程接管】
+    # 当 api_mode == "codex_app_server" 时，将整轮对话委托给 codex app-server 子进程处理。
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
     # app-server subprocess (see agent/transports/codex_app_server_session.py).
     if agent.api_mode == "codex_app_server":
@@ -1916,6 +2008,9 @@ def _run_conversation_turn(
         from agent.turn_recovery import activate_codex_app_server_fallback
         if not activate_codex_app_server_fallback(agent, codex_result):
             return codex_result
+        # 【备用回退激活：在通用循环中无缝重试本轮】
+        # 激活 Fallback 后重写了 provider/model/api_mode：在下方的通用循环中直接重试当前用户轮次，
+        # 并将 codex 预测的行与其失败的 API 调用计入本轮统计。
         # Fallback activation rewrote provider/model/api_mode: retry this same user turn on the generic
         # loop below, keeping codex's projected rows and its failed API call in the turn's accounting.
         s.api_call_count = int(codex_result.get("api_calls") or 0)
@@ -1968,12 +2063,15 @@ def _run_conversation_turn(
             if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
                 break
 
+    # 【循环收尾逻辑移至 agent/turn_finalizer.finalize_turn】
     # Post-loop finalization lives in agent/turn_finalizer.finalize_turn.
     result = finalize_turn(agent, **{
         name: getattr(s, name)
         for name in inspect.signature(finalize_turn).parameters if name != "agent"
     })
     if s._compression_timeout_exhausted:
+        # 【复用网关上下文恢复契约】
+        # 消息历史保持完好，未来的输入可以迁移到干净的新会话中（参见 issue #98722）。
         # Reuse the gateway's context-recovery contract: transcript stays intact while
         # future input can move to a clean session (#98722).
         result.update(error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE, partial=True, compression_exhausted=True)
@@ -2013,6 +2111,8 @@ def run_conversation(
     from agent.turn_context import export_current_turn_boundary
     from tools.vision_tools_history_budget import native_turn_images
 
+    # 【本轮用户附带的原生图片在当前轮次内对 vision_analyze 保持可见】
+    # 避免在同一请求中重复嵌入相同的像素数据（参见 issue #76411）。
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):
@@ -2077,6 +2177,9 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
             return
         if getattr(agent, "_persist_disabled", False) or db.latest_conversation_role(session_id) != "user":
             return
+        # 【限定工具执行扫描作用域】
+        # 当轮次边界明确时，仅在本轮消息范围内扫描“是否有工具运行”；
+        # 否则兜底扫描整个消息列表，宁可过度防御也不漏报潜在的写副作用。
         # Scope the "did a tool run" scan to this turn when its boundary is proven; otherwise
         # hedge over the whole list rather than under-report a possible side effect.
         start = result.get("current_turn_user_idx")

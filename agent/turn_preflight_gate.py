@@ -77,6 +77,8 @@ def run_preflight_gate(
         v.action = "break"
         return v
 
+    # API 调用前置压力检查：工具调用结果会大幅膨胀当前轮次，而 last_prompt_tokens 往往滞后。
+    # 镜像复用轮次序幕（turn-prologue）守卫链逻辑：粗糙估算时推迟、失败冷却期内跳过，而后调用 should_compress()。
     # Pre-API pressure check: tool results grow a turn and last_prompt_tokens lags
     # them. Mirror the turn-prologue guard chain: defer on noisy estimate, skip in
     # failure cooldown, then should_compress().
@@ -86,9 +88,12 @@ def run_preflight_gate(
         _preflight_threshold <= 0 or request_pressure_tokens >= _preflight_threshold
     )
     if _provider_overflow_recovery_pending and not _provider_overflow_preflight:
+        # 外层循环重建已囊括 System Prompt、请求级注入项和工具 Schema；
+        # 只有在预留了足够模型输出安全跑道（Output Runway）的完整请求才允许发送。
         # The outer-loop rebuild includes system prompt, request-only injections and
         # tool schemas; only that full request with output runway may be sent.
         v._provider_overflow_recovery_pending = False
+    # 对比完整组装后的请求体，而非裸 ``messages``（后者遗漏了 api_content、插件注入项、预填、MoA 上下文及临时系统文本）。
     # Compare fully assembled requests, not raw ``messages`` (which omit
     # api_content, plugin injections, prefills, MoA context, ephemeral system text).
     if (
@@ -98,6 +103,7 @@ def run_preflight_gate(
             _last_preflight_pressure, request_pressure_tokens, _preflight_threshold
         )
     ):
+        # 压缩收益不足阻断：停止本轮后续的主动压缩重试，同时不消耗共享的溢出恢复配额；若仍超限交给 Provider 错误处理器再次压缩。
         # Stop proactive retries this turn without consuming the shared overflow-
         # recovery budget; the provider's error handler may still compact.
         v._preflight_compression_blocked = True
@@ -110,6 +116,7 @@ def run_preflight_gate(
     return run_preflight_compression(
         agent, v, compressor=_compressor, request_pressure_tokens=request_pressure_tokens,
         provider_overflow_preflight=_provider_overflow_preflight,
+        # 锚定数值为真实用量 + 本轮增量（Real Usage + Delta），绝对不推迟。仅全量上下文粗估算才等待 Provider 的真实读数。
         # An anchored figure is real usage + delta: never deferred. Only a whole-context rough
         # estimate waits for the provider's count.
         defer_preflight=(

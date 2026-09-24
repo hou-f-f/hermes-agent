@@ -1,4 +1,17 @@
-"""Per-turn setup for ``run_conversation`` (the turn prologue).
+"""【模块概述 / Architecture Overview】
+单轮对话前置环境搭建（Turn Prologue），为 `run_conversation` 组装单轮上下文。
+
+`build_turn_context` 负责执行每轮一次的初始化配置：
+1. 标准输入输出安全防护（stdio guard）与 Unicode 代用字符清洗；
+2. 提示词恢复或构建（`restore_or_build_system_prompt`）；
+3. 数据库会话行与当前发言者身份解析；
+4. 空闲与前置上下文压缩门禁（`turn_context_compaction`）；
+5. 插件 `pre_llm_call` 拦截钩子调用与外部向量记忆预取（Prefetch）；
+6. 组装 `api_content` 边车，并在不破坏持久化转录本的前提下注入单轮短时记忆。
+最终返回轻量级数据类 `TurnContext`，仅包含主循环后续阶段所必需的局部变量。
+`build_api_messages` 负责构建单次网络调用的 wire copy 副本。
+
+Per-turn setup for ``run_conversation`` (the turn prologue).
 
 ``build_turn_context`` runs the once-per-turn setup (stdio guard, sanitization, prompt
 restore-or-build, session row, idle/preflight compaction via ``turn_context_compaction``,
@@ -32,14 +45,20 @@ logger = logging.getLogger(__name__)
 
 
 def _str_attr(agent: Any, name: str) -> str:
-    """``getattr(agent, name, "") or ""`` — route facts read off partial agents/doubles."""
+    """安全读取 Agent 或模拟测试桩上的字符串属性：``getattr(agent, name, "") or ""``。"""
     return getattr(agent, name, "") or ""
 
 
 def _preflight_request_tokens(
     agent: Any, messages: List[Dict[str, Any]], system_prompt: str
 ) -> int:
-    """Token estimate for automatic preflight compression: a valid provider usage anchor,
+    """【前置自动压缩 Token 需求精确评估 / Preflight Request Token Estimation】
+    在调用前评估请求 Token 总量，决定是否触发前置压缩：
+    1. 优先使用大模型服务商此前返回的权威用量锚点（Usage Anchor）；
+    2. 针对支持原生 Responses 压缩检查点的模型，使用裁剪后的精确 wire 载荷估算；
+    3. 兜底使用通用启发式估算器，并根据当前模型路由判断是否计入陈旧思考内容的 Token 开销。
+
+    Token estimate for automatic preflight compression: a valid provider usage anchor,
     else the checkpoint-pruned native wire payload, else the generic estimator."""
     anchored = anchored_context_tokens(messages, getattr(agent, "_usage_anchor", None))
     agent._request_pressure_anchored = anchored is not None
@@ -67,7 +86,11 @@ def _preflight_request_tokens(
 
 
 def _agent_stale_thinking_on_wire(agent: Any) -> bool:
-    """Whether the active route replays stale thinking text; ``True`` (conservative full
+    """【判断历史思考内容是否会在网络线路上回放】
+    检查当前模型路由是否会回放以往轮次的思考链（Thinking/Reasoning）；
+    若路由信息缺失，则采取保守策略（True，全额计费）。
+    
+    Whether the active route replays stale thinking text; ``True`` (conservative full
     charge) when route facts are unavailable."""
     try:
         from agent.message_sanitization import stale_thinking_reaches_wire
@@ -82,7 +105,12 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
 def compose_multimodal_context_part(
     ext_prefetch_cache: str, plugin_user_context: str,
 ) -> Optional[str]:
-    """The ephemeral context of one turn (memory prefetch + ``pre_llm_call``) as one text
+    """【组装单轮瞬时动态上下文文本块 / Compose Ephemeral Context Part】
+    将本轮对话注入的临时上下文（外部记忆预取 + plugin 的 pre_llm_call 钩子文本）组装为一个文本块；
+    若没有任何注入则返回 None。
+    字符串消息通过边车（sidecar）追加，多模态（list）消息则作为持久化的 text 分块携带（参见 issue #71998）。
+
+    The ephemeral context of one turn (memory prefetch + ``pre_llm_call``) as one text
     block; ``None`` when nothing is injected. The string sidecar appends it to ``content``;
     a multimodal (list) turn carries it as a durable text part (#71998)."""
     fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
@@ -93,7 +121,12 @@ def compose_multimodal_context_part(
 def compose_user_api_content(
     content: Any, ext_prefetch_cache: str, plugin_user_context: str
 ) -> Optional[str]:
-    """Compose the API-bound content of the current turn's string user message.
+    """【组装当前轮次发送给大模型的实际 user 文本 / Compose User API Content】
+    作为 `api_content` 边车与真正发往网络字节的唯一真实来源，确保二者绝不漂移：
+    轮次 N 发送的内容必须与轮次 N+1 回放历史时完全一致，坚守提示词缓存命中率。
+    若无上下文注入或 content 为列表（多模态内容走独立的 text part 路径），则返回 None。
+
+    Compose the API-bound content of the current turn's string user message.
 
     Single source for the ``api_content`` sidecar and the wire bytes so they never drift
     (what turn N sends is what turn N+1 replays). ``None`` when nothing is injected or the
@@ -105,7 +138,11 @@ def compose_user_api_content(
 
 
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
-    """Pop the ``api_content`` sidecar and substitute it into ``content`` (keeps the
+    """【弹出并替换 api_content 边车至正文】
+    将暂存在 `api_msg["api_content"]` 中的结构化文本弹出，并替换到 `api_msg["content"]` 中，
+    保持大模型提供商的 Prompt 缓存前缀字节完全稳定。返回弹出的边车文本，若不存在则返回 None。
+
+    Pop the ``api_content`` sidecar and substitute it into ``content`` (keeps the
     prompt-cache prefix byte-stable). Returns the popped sidecar, or ``None``."""
     sidecar = api_msg.pop("api_content", None)
     if isinstance(sidecar, str) and sidecar and api_msg.get("role") in ("user", "assistant"):
@@ -114,19 +151,26 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
 
 
 def drop_stale_api_content(msg: Dict[str, Any]) -> None:
-    """Drop the ``api_content`` sidecar from a message whose content was rewritten
+    """【丢弃已过期的 api_content 边车】
+    当消息内容被修改或重写时调用（若继续回放旧边车会重发已被删除的脏数据；代价仅为单次缓存未命中）。
+    
+    Drop the ``api_content`` sidecar from a message whose content was rewritten
     (replaying it would resend what the rewrite removed; cost is one cache miss)."""
     msg.pop("api_content", None)
 
 
 def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
-    """Extract the ``api_content`` sidecar; ``None`` when absent/non-string."""
+    """提取消息中的 `api_content` 边车字符串；若不存在或非字符串则返回 None。"""
     v = msg.get("api_content")
     return v if isinstance(v, str) else None
 
 
 def _pop_turn_note(agent: Any, attr: str) -> str:
-    """One-shot per-turn note: read and clear, so the system prompt stays byte-stable and a
+    """【一次性单轮注记安全读取并清空 / One-Shot Turn Note】
+    读取并立即清空单轮注记：
+    保持 System Prompt 始终字节稳定，同时确保在网关跨轮次缓存复用 agent 实例时，绝不错误重放过期的单轮注记。
+    
+    One-shot per-turn note: read and clear, so the system prompt stays byte-stable and a
     cached agent never replays a stale note."""
     note = getattr(agent, attr, "") or ""
     if hasattr(agent, attr):
@@ -136,19 +180,23 @@ def _pop_turn_note(agent: Any, attr: str) -> str:
 
 
 def consume_gateway_turn_context_notes(agent: Any) -> str:
-    """Pop the gateway's per-turn must-deliver notes."""
+    """消费并清空网关必须投递的单轮上下文注记。"""
     return _pop_turn_note(agent, "_gateway_turn_context_notes")
 
 
 def consume_surface_switch_note(agent: Any) -> str:
-    """Pop the surface-switch note staged by the system-prompt restore (#104414); rides the same
+    """【消费界面切换注记 / Surface Switch Note (issue #104414)】
+    消费由系统提示词恢复流程暂存的客户端界面切换注记（如从 CLI 切换到 Desktop 桌面端）；
+    该注记与网关注记共享同一个用户消息通道，位于已缓存的前缀之后动态注入，
+    坚决不碰 token 0 处的提示词缓存，零成本完成界面能力声明的动态适配。
+
+    Pop the surface-switch note staged by the system-prompt restore (#104414); rides the same
     user-message channel as the gateway notes, behind the cached prefix."""
     return _pop_turn_note(agent, "_surface_switch_note")
 
 
 def append_notes_to_multimodal_content(content: Any, notes: Optional[str]) -> bool:
-    """Append must-deliver notes as a durable text part on a multimodal (list) user
-    message (the sidecar path returns ``None`` for non-string content)."""
+    """将必须投递的注记作为持久化的 text 分块追加到多模态（list）用户消息末尾。"""
     if not notes or not isinstance(content, list):
         return False
     with suppress(Exception):
@@ -157,6 +205,7 @@ def append_notes_to_multimodal_content(content: Any, notes: Optional[str]) -> bo
     return False
 
 
+# 不应自动生成标题的平台白名单：定时任务有自己的命名规范且首句是投递提示；子 Agent 对用户完全不可见
 # Surfaces whose sessions must not be auto-titled: cron names its own session and
 # its opener is a delivery hint; subagent sessions are hidden from every picker.
 _UNTITLED_PLATFORMS = frozenset({"cron", "subagent"})

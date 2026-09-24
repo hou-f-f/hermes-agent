@@ -52,7 +52,12 @@ class AssembledRequest:
 
 
 def _append_moa_context(agent: Any, api_messages: Any, moa_config: Any, original_user_message: Any) -> None:
-    """Run the MoA reference models and append their aggregated context to the last user
+    """【并行聚合 MoA 参考模型上下文 / Append MoA Context】
+    运行 MoA（Mixture-of-Agents）参考模型集合，并将它们聚合后的多视角推理上下文
+    追加至最新一条用户消息末尾（在多模态轮次中作为尾部文本分块追加）。
+    设计哲学：故障开放（Fail-open），任何参考模型故障均记录日志并放行，绝不阻断主模型调用。
+
+    Run the MoA reference models and append their aggregated context to the last user
     message (as a trailing text part on multimodal turns). Fail-open."""
     try:
         from agent.message_content import flatten_message_text as _flatten_mt
@@ -98,7 +103,11 @@ def _append_moa_context(agent: Any, api_messages: Any, moa_config: Any, original
 
 
 def _prepare_moa_request(agent: Any, api_messages: Any, pending_moa_prepared_request: Any) -> tuple:
-    """Persistent-MoA request: rebase the pending prepared request onto the new messages
+    """【持久化 MoA 请求重定基底 / Prepare MoA Request】
+    若客户端支持，将挂起的已准备 MoA 请求重定基底（rebase）到新消息上；
+    否则重新准备全新请求。返回 ``(prepared_request, api_messages, pending_moa_prepared_request)``。
+
+    Persistent-MoA request: rebase the pending prepared request onto the new messages
     when the client supports it, else prepare a fresh one. Returns
     ``(prepared_request, api_messages, pending_moa_prepared_request)``."""
     _moa_completions = getattr(getattr(agent.client, "chat", None), "completions", None)
@@ -147,6 +156,9 @@ def assemble_api_request(
     if moa_config:
         _append_moa_context(agent, api_messages, moa_config, original_user_message)
 
+    # 【请求级临时预填消息注入 / Ephemeral Prefills】
+    # 仅在发起 API 调用时生效，紧随 System Prompt 之后注入。
+    # 必须执行结构深拷贝（Structural Clone），防止后续就地清洗消毒操作穿透破坏原始预填容器。
     # Ephemeral prefill messages go right after the system prompt, API-call-time only.
     if agent.prefill_messages:
         sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
@@ -155,6 +167,8 @@ def assemble_api_request(
             # through into agent.prefill_messages' nested containers.
             api_messages.insert(sys_offset + idx, _clone_message_for_send(pfm))
 
+    # 【单轮上下文动态筛选钩子 / Context Engine Selection Hook】
+    # 允许外部上下文引擎仅针对本次调用动态挑选或替换上下文（单次请求生效、故障开放，且与 should_compress 相互独立）。
     # Per-turn context selection hook: an engine may select/replace context for THIS
     # call only — request-only, fail-open, and independent of should_compress().
     _sel_incoming = (
@@ -164,9 +178,14 @@ def assemble_api_request(
         agent, api_messages, messages, _sel_incoming, logger=request_logger
     )
 
+    # 【无条件执行 API 消息清洗消毒】
+    # 不依赖 context_compressor 状态，确保在恢复会话或用户手动编辑历史消息后，孤立的工具结果（无对应 tool_call）必然被兜底捕获与清洗。
     # Runs unconditionally (not gated on context_compressor) so orphaned tool
     # results from session loading or manual message edits are always caught.
     api_messages = agent._sanitize_api_messages(api_messages)
+    # 【发送路径多模态视觉过期驱逐（Vision Eviction）】
+    # 压缩策略仅在剪枝时剔除陈旧截图，且 Anthropic 适配器的保留窗口无法识别 OpenAI 风格的 tool-result image_url。
+    # 在此仅对当前调用的请求副本原地驱逐旧图，持久化在磁盘上的真实历史毫发无损（参见 issue #89296）。
     # Send-path vision eviction (#89296): compression only strips stale screenshots
     # when prune fires, and the Anthropic adapter's keep-window never sees
     # OpenAI-style tool-result image_url parts. The per-call clone is rewritten in
@@ -175,6 +194,9 @@ def assemble_api_request(
 
     evict_stale_outbound_tool_images(api_messages)
 
+    # 【自愈提示广播铁律 / Sanitizer Heal Notice】
+    # 重复清洗自愈通知仅通过 status/warning 回调向外广播，绝对严禁追加到消息列表中，
+    # 确保长会话的前缀缓存（Prompt Caching）字节级绝对一致。
     # One-time repeated-heal notice goes out via the status/warning callback, NEVER
     # appended to messages: the cached prompt prefix stays byte-identical.
     try:
@@ -186,6 +208,9 @@ def assemble_api_request(
     except Exception:
         logger.debug("sanitizer heal notice delivery failed", exc_info=True)
 
+    # 【剔除纯思考回合与相邻用户消息合并 / Drop Thinking & Merge Users】
+    # 仅修饰 API 发送副本：Anthropic 等模型服务对以 `thinking` 结尾的请求直接报 400 错误；
+    # 同时在非 Codex 协议下剥离 Codex 专用的控制催促文本（issue #67321）。
     # Drop thinking-only assistant turns + merge adjacent users, API copy only:
     # Anthropic-style backends 400 on a trailing `thinking` block; history keeps it.
     # Off the Codex wire (e.g. after a reasoning-only stall fell over to a Chat Completions
@@ -197,6 +222,8 @@ def assemble_api_request(
         drop_nudge_marker=_CODEX_INCOMPLETE_NUDGE if _cross_protocol else None,
     )
 
+    # 【空白符与工具 JSON 规范化 / Bit-Perfect Canonicalization】
+    # 在跨轮次交互中消除首尾多余空白，规整工具参数 JSON，确保前缀缓存字节级命中（本地模型复用 KV 缓存，云端大幅降低 Token 计费）。
     # Normalize whitespace and tool-call JSON for bit-perfect prefixes across turns
     # (KV-cache reuse on local servers, better cloud cache hits); API copy only.
     for am in api_messages:
@@ -204,6 +231,8 @@ def assemble_api_request(
             am["content"] = am["content"].strip()
     _canonicalize_api_tool_calls(api_messages)
 
+    # 【清洗孤立代理对字符 / Strip Lone Surrogates】
+    # 某些本地 Ollama 服务模型吐出的孤立代理字符（U+D800~U+DFFF）会导致 OpenAI SDK 内部的 json.dumps() 崩溃并触发 3 次重试，在此提前消毒。
     # Strip lone surrogates (U+D800-U+DFFF) that some Ollama-served models emit;
     # they crash json.dumps() inside the OpenAI SDK and trigger the 3-retry cycle.
     _sanitize_messages_surrogates(api_messages)
@@ -211,6 +240,8 @@ def assemble_api_request(
     # No send-time pad loop here: ``repair_empty_non_final_messages`` (inside
     # ``_sanitize_api_messages``) is the single owner of empty-turn repair.
 
+    # 【在所有变换的最后构建 Prompt Cache 断点】
+    # 缓存标记必须在所有消息原地变换之后再行构建；标准工具注册表保持纯净无装饰。
     # Build the request-local cache sections LAST, after every transcript mutation;
     # the canonical tool registry stays undecorated. Marked ``content`` becomes text
     # blocks the whitespace pass skips, so the same row's bytes vary across turns.
@@ -241,6 +272,8 @@ def assemble_api_request(
         api_messages = _initial_cache_plan.messages
         tools_for_api = _initial_cache_plan.tools
 
+    # 【持久化 MoA 请求重定基底】
+    # 在计算压缩压力前准备 MoA 请求；顾问模型的临时输出不在 messages 中，create() 复用该请求避免重复运行顾问。
     # Prepare the persistent-MoA request before measuring compression pressure: the
     # ephemeral advisor output is absent from ``messages``; ``create()`` reuses the
     # prepared request instead of running the advisors again.
@@ -250,6 +283,8 @@ def assemble_api_request(
             agent, api_messages, pending_moa_prepared_request
         )
 
+    # 【双重上下文 Token 估算】
+    # 剥离图片后的估算喂给两个指标；工具 Schema 独立计数（50+ 工具约占 2~3 万 Token）。
     # One image-stripped estimate feeds both figures; tools counted separately (50+
     # tools ≈ 20-30K tokens); total_chars is a rough proxy for logs/hooks only.
     # Charge stale thinking only when the active route replays it.
@@ -259,6 +294,9 @@ def assemble_api_request(
         approx_tokens = estimate_messages_tokens_rough(api_messages)
     else:
         approx_tokens = estimate_messages_tokens_rough(api_messages, charge_stale_thinking=False)
+    # 【感知路由的上下文压力评估 / Route-Aware Context Pressure】
+    # 当请求支持 Native Responses 原生压缩时，传输层在发送前会自动进行检查点剪枝。
+    # 若用通用的持久化历史计算会严重高估 Token 数，导致误触发长达 600 秒的不必要本地压缩（参见 issue #96995）。
     # Route-aware: native Responses compaction prunes the wire payload, so the raw
     # history figure overstates it and fires needless local compression.
     # Route-aware pressure: when the upcoming request is eligible for native Responses compaction the
@@ -268,6 +306,9 @@ def assemble_api_request(
     request_pressure_tokens = _midturn_request_pressure_tokens(
         agent, api_messages, effective_system or "", approx_tokens
     )
+    # 【用量锚点优先覆盖 / Usage-Anchored Override】
+    # 用真实的 API prompt_tokens（包含 system 和工具定义）+ 当前轮次增量估算，替代全量历史经验启发式估算；
+    # 当锚点新鲜时提供最精确的 Token 读数。
     # Usage-anchored override: real prompt_tokens (incl. system + tool schemas) +
     # delta estimate replaces the whole-history heuristic when the anchor is fresh.
     _anchored_pressure = anchored_context_tokens(messages, getattr(agent, "_usage_anchor", None))

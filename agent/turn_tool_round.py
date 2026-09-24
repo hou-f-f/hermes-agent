@@ -178,11 +178,15 @@ def run_tool_round(
         failed = True
         return _verdict("break")
 
+    # 前端 UI 严禁观测到仅存在于内存中的助理/工具调用行：
+    # 必须在成功落盘追加到数据库之后，才向外部广播临时阶段性解说（interim commentary）。
     # A UI must never observe an assistant/tool-call row that is only an in-memory
     # projection: emit interim commentary after the DB append.
     if not duplicate_previous_interim:
         agent._emit_interim_assistant_message(assistant_msg)
 
+    # 在执行工具前冲刷掉当前未闭合的流式文本框，防止早先吐出的文本与工具执行日志缠绕混杂。
+    # 仅针对前端显示回调生效 —— 文本转语音 TTS（_stream_callback）绝对不能接收 None（表示 EOS 流结束）。
     # Flush open streaming boxes before tools so early content doesn't wrap tool feed
     # lines. Display callback only — TTS (_stream_callback) must NOT receive None (EOS).
     if agent.stream_delta_callback:
@@ -192,6 +196,7 @@ def run_tool_round(
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
     if getattr(agent, "_incremental_persistence_failed", False):
+        # 工具执行结果无法持久化落盘：绝对不要将纯内存临时结果发送给模型，也不要在本轮投射后续事件，直接终止。
         # Tool result could not be made canonical: never send the in-memory result to
         # the model or project later events from this turn.
         _turn_exit_reason = "session_persistence_failed"
@@ -205,6 +210,7 @@ def run_tool_round(
         final_response = agent._toolguard_controlled_halt_response(decision)
         agent._emit_diagnostic_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
         append_message(messages, {"role": "assistant", "content": final_response})
+        # 显式广播安全拦截原因，避免用户误以为程序崩溃；此时流式回调依然保活，SSE/TUI 客户端能完整展示拦截说明。
         # Emit the halt so it isn't mistaken for a crash; the stream callback is still
         # alive, so SSE/TUI clients see the explanation.
         if final_response:
@@ -215,11 +221,17 @@ def run_tool_round(
                     agent.stream_delta_callback(None)
         return _verdict("break")
 
+    # 重置单轮重试计数器，防止某一次截断污染整轮会话
     # Reset per-turn retry counters so one truncation can't poison the turn.
     truncated_tool_call_retries = 0
+    # 延迟分段换行：当真正的正文到来时，_fire_stream_delta() 会在前端补充一个 "\n\n"，
+    # 从而避免多轮工具执行之间堆积大量无意义的空行。
     # Defer the paragraph break: _fire_stream_delta() prepends one "\n\n" when real
     # text arrives, so tool iterations don't stack blank lines.
     agent._stream_needs_break = True
+    # 预算退还机制（Iteration Budget Refund）：
+    # 当本次轮次调用的唯一工具是 `execute_code`（通过代码解释器进行编程式工具调用）时，
+    # 这种开销极低的 RPC 风格快速调用不应白白扣减宝贵的模型交互迭代预算，在此将扣除的配额退还。
     # Refund the iteration when the ONLY tool was execute_code (programmatic tool
     # calling) — cheap RPC-style calls shouldn't eat the budget.
     if {tc.function.name for tc in assistant_message.tool_calls} == {"execute_code"}:
@@ -243,8 +255,13 @@ def run_tool_round(
     if _ptc.end_turn:
         return _verdict("break")
 
+    # 增量保存会话日志（确保即使后续被用户打断，之前的执行进度依然可见）
     # Save session log incrementally (so progress is visible even if interrupted)
     agent._session_messages = messages
+    # 【刷新活跃度时间戳以防网关超时被杀 / Gateway Inactivity Timeout Prevention】
+    # 关键机制：在继续下一轮之前触碰活跃状态（touch activity），
+    # 避免工具执行完成到下一次 API 调用开始之间的耗时（如耗时的上下文压缩、数据库落盘以及较慢的后续 API）
+    # 导致网关的空闲监控检测到陈旧时间戳而误将 Agent 杀掉（HERMES_AGENT_TIMEOUT 默认 1800 秒，参见 issue #69559, #69131）。
     # Touch activity so slow post-tool work plus a slow follow-up API call can't exceed
     # the gateway inactivity timeout (HERMES_AGENT_TIMEOUT).
     # Touch activity before continuing so the gateway's inactivity monitor never sees a stale timestamp
@@ -259,7 +276,16 @@ def run_tool_round(
 def stage_tool_call_message(
     agent: Any, *, assistant_message: Any, finish_reason: Any, messages: Any
 ) -> Tuple[Dict[str, Any], bool]:
-    """Build the assistant tool-call row and update the per-turn fallback/mute state.
+    """【暂存工具调用消息并更新单轮静音/兜底状态 / Stage Tool Call Message】
+    构建 assistant 的 tool_calls 消息字典，并处理轮次级边界状态：
+    1. 丢弃工具调用旁裸露的中括号协议脚手架标记（如 `[memory]`，防止重试死循环，issue #78148）；
+    2. 分类内务/管家工具（Housekeeping Tools）：若全部为内存/待办/搜索等静默工具，则开启流式静音；若包含实际操作工具，清除静音；
+    3. 保留伴随工具调用的可见文本作为兜底最终回复（fallback final response），防止后续轮次返回空内容；
+    4. 弹出前置思考注入预填消息（`_thinking_prefill`），重置重试计数；
+    5. 重置空结果催促与遗漏调用计数器；
+    6. 检测是否与前序 incomplete 消息重复，返回 `(assistant_msg, duplicate_previous_interim)`。
+
+    Build the assistant tool-call row and update the per-turn fallback/mute state.
 
     Drops a bare bracketed marker beside a call (#78148), classifies housekeeping-only
     rounds, keeps visible content as the empty-follow-up fallback, pops thinking-only
@@ -273,6 +299,8 @@ def stage_tool_call_message(
 
     turn_content = assistant_message.content or ""
 
+    # 工具调用旁孤立的中括号标记（例如 ``[memory]``）属于协议脚手架残留；
+    # 若将其持久化，后续工具执行完毕后的兜底重放机制会永远重放该标记（参见 issue #78148）。
     # A bare bracketed token (e.g. ``[memory]``) beside a function call is protocol
     # scaffolding; persisting it lets the post-tool fallback replay it forever (#78148).
     if assistant_message.tool_calls and _STALE_MARKER_RE.fullmatch(turn_content.strip()):
@@ -282,6 +310,9 @@ def stage_tool_call_message(
         turn_content = ""
         assistant_msg["content"] = ""
 
+    # 无论可见内容如何，对工具进行分类：包含实体工具（非管家内务工具）的轮次必须
+    # 使旧的管家工具兜底失效（避免两轮前的管家解说被错误归因于当前工具轮次），
+    # 并清除先前管家轮次设置的静音标记，否则 _vprint 会压制当前工具的进度输出。
     # Classify tools regardless of visible content: a substantive tool-only turn must
     # invalidate any older housekeeping fallback (so a two-turn-old housekeeping
     # narration isn't attributed to the preceding tool turn), and clear the mute flag a
@@ -294,6 +325,9 @@ def stage_tool_call_message(
         agent._last_content_tools_all_housekeeping = False
         agent._mute_post_response = False
 
+    # 单轮内同时包含文本 content 和 tool_calls：保留该文本作为兜底最终回复（fallback final response），
+    # 以防工具执行后的后续轮次返回空内容。
+    # 仅当所有工具均为事后管家内务工具时静音；包含实体操作工具时保持输出开启。
     # Content + tool_calls in one turn: keep the content as a fallback final response in
     # case the follow-up turn after tools is empty. Mute only when EVERY tool call is
     # post-response housekeeping; substantive tools keep output on.
@@ -307,6 +341,8 @@ def stage_tool_call_message(
             if clean:
                 agent._vprint(f"  ┊ 💬 {clean}")
 
+    # 在追加新消息之前，弹出仅包含思考内容的预填消息（与 final-response 路径逻辑相同）。
+    # 在预填恢复后成功触发工具调用会重置预填计数器，因此每次工具调用的成功都是全新的起点，而不是累积消耗。
     # Pop thinking-only prefill message(s) before appending (same rationale as the
     # final-response path). Tool calls after a prefill recovery reset the prefill
     # counter, so each tool-call success is a fresh start, not a cumulative burn.
@@ -317,6 +353,8 @@ def stage_tool_call_message(
     if _had_prefill:
         agent._thinking_prefill_retries = 0
         agent._empty_content_retries = 0
+    # 重新装载工具执行后的空响应催促（post-tool nudge），使其在后续的工具轮次中仍能触发；
+    # 工具调用的成功落地说明已经从工具调用丢失停滞中恢复，因此每个停滞状态刷新该预算。
     # Re-arm the post-tool nudge so it can fire on a LATER tool round; a landed tool call
     # recovers any dropped-tool-call stall, so refresh that budget per stall.
     agent._post_tool_empty_retried = False

@@ -35,7 +35,11 @@ logger = logging.getLogger("agent.conversation_loop")
 
 
 def stop_thinking_spinner(agent: Any, thinking_spinner: Any) -> None:
-    """Stop the spinner silently and clear the thinking callback; returns ``None`` so
+    """【静默停止思考动画并清空回调】
+    静默停止思考动画 Spinner 并清空 thinking 回调；返回 None 便于调用方以
+    `thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)` 形式就地重新绑定。
+
+    Stop the spinner silently and clear the thinking callback; returns ``None`` so
     callers can rebind ``thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)``."""
     if thinking_spinner:
         thinking_spinner.stop("")
@@ -61,7 +65,15 @@ class ApiCallVerdict:
 
 
 def _should_stream(agent: Any) -> bool:
-    """Streaming is preferred even without consumers (stale-stream / read-timeout health
+    """【流式传输决策判定 / Streaming Decision】
+    即使没有监听消费者也优先开启流式（用于陈旧连接检测与读取超时健康保活检查）；
+    禁用流式的特例场景：
+    1. 显式配置了 `_disable_streaming=True`；
+    2. 使用 ACP 协议（`acp://`）或外部进程独立 Provider 配置文件；
+    3. 无界面显示监听者的 MoA（混合模型架构）；
+    4. 单元测试中的 Mock 客户端（非真实流迭代器）。
+
+    Streaming is preferred even without consumers (stale-stream / read-timeout health
     checks); disabled on provider signal, ACP providers (``acp://`` scheme or an
     external-process provider profile), MoA without a display consumer, or Mock clients in
     tests (SimpleNamespace, not stream iterators)."""
@@ -186,7 +198,12 @@ def perform_api_call(
 
 @dataclass
 class ApiInterruptVerdict:
-    """Always ``action == "break"`` (leave the retry loop): either a redirect restart was
+    """【API 中断裁决结果 / API Interrupt Verdict】
+    必定为 ``action == "break"``（跳出当前重试循环）：
+    要么在 ``_retry`` 上装载了重定向重启（redirect restart），
+    要么本轮被设为 ``interrupted`` 并设置了 ``final_response``。
+
+    Always ``action == "break"`` (leave the retry loop): either a redirect restart was
     armed on ``_retry`` or the turn is ``interrupted`` with ``final_response`` set."""
 
     action: str
@@ -199,12 +216,19 @@ def handle_api_interrupt(
     agent: Any, *, _retry: Any, thinking_spinner: Any, messages: Any, conversation_history: Any,
     api_start_time: Any, interrupted: Any, final_response: Any,
 ) -> ApiInterruptVerdict:
-    """``InterruptedError`` during the provider call: a pending redirect keeps its correction
+    """【处理 API 调用期间触发的中断异常 / Handle InterruptedError】
+    调用模型中途捕获到 `InterruptedError` 时的恢复动作：
+    - 若存在待处理的用户重定向（redirect），保持纠偏指令在队列中供外层重构使用；
+    - 否则保留已接收到的流式局部文本，以便下一轮对话能够记录下该未完成的半截回复（避免彻底失忆）。
+
+    ``InterruptedError`` during the provider call: a pending redirect keeps its correction
     queued for the outer-loop rebuild; otherwise keep any streamed partial text so the next
     turn has a record of the half-finished reply."""
     from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
+    # redirect() 仅取消本次 HTTP 请求：保持纠偏指示在队列中，清除取消标记，
+    # 交由外层循环重建请求。绝不具体化不完整的签名/加密推理项。
     # redirect() cancelled only this request: keep the correction queued, clear the
     # cancellation bit, let the outer loop rebuild. Never materialize incomplete
     # signed/encrypted reasoning items.
@@ -218,6 +242,9 @@ def handle_api_interrupt(
         getattr(agent, "_current_streamed_assistant_text", "") or ""
     ).strip()
     if _partial and is_runaway_repetition(_partial):
+        # 被打断的消息行会在下一轮作为历史重放；若存在死循环重复的字节，重放会重新引发死循环（issue #112764）。
+        # 与重定向占位符采用相同的隐藏形态（display_kind="hidden"）：在对话记录中对人类不可见，
+        # 附带中性的 api_content，确保调用前的清洗器不会误对其二次自愈。
         # The interrupted row is replayed next turn; looped bytes there re-seed the loop
         # (#112764). Same hidden shape as the redirect placeholder: nothing visible in the
         # transcript, a neutral api_content so the pre-call sanitizer does not re-heal it.
@@ -237,7 +264,12 @@ def handle_api_interrupt(
 
 @dataclass
 class NousRateGuardVerdict:
-    """``action``: ``"fallthrough"`` (no active limit — make the call), ``"break"``
+    """【Nous 速率守卫裁决 / Nous Rate Guard Verdict】
+    ``action``: ``"fallthrough"``（无活跃限制，正常发起调用）、
+    ``"break"``（在 ``_retry`` 上装载备用模型 Fallback 重启）、
+    ``"return"``（无可用备用模型，返回失败结果字典）。
+
+    ``action``: ``"fallthrough"`` (no active limit — make the call), ``"break"``
     (fallback armed on ``_retry``) or ``"return"`` (``result``: no fallback available)."""
 
     action: str
@@ -251,7 +283,12 @@ def nous_rate_limit_guard(
     agent: Any, *, _retry: Any, api_messages: Any, messages: Any, conversation_history: Any,
     active_system_prompt: Any, retry_count: Any, compression_attempts: Any, api_call_count: Any,
 ) -> NousRateGuardVerdict:
-    """Skip the call if another session recorded a Nous Portal rate limit: every attempt (incl.
+    """【Nous Portal 速率限制防雪崩守卫】
+    若另一个会话记录了 Nous Portal 速率限制（429），跳过当前调用尝试：
+    因为每一次网络握手（包括 SDK 内部重试）都会扣减每小时请求配额（RPH）。
+    守卫内部使用安全保护，绝不让速率守卫本身的异常击穿智能体主循环。
+
+    Skip the call if another session recorded a Nous Portal rate limit: every attempt (incl.
     SDK retries) counts against RPH. Never lets the guard itself break the agent loop."""
     from agent.conversation_loop import _arm_fallback_restart
 
