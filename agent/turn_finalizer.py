@@ -1,4 +1,16 @@
-"""Post-loop turn finalization for ``run_conversation``.
+"""【对话轮次收尾终结器 / Conversation Turn Post-Loop Finalizer】
+驱动单个用户对话轮次（run_conversation）从模型交互结束到最终交付闭环的核心收尾流水线：
+1. 预算总结与执行轨迹归档（Trajectory Save）；
+2. 最终响应清洗与乱码消毒（UTF-16 Surrogate Scrubbing，杜绝 Telegram/Signal/终端乱码崩溃）；
+3. 执行微压缩（Post-turn Micro-compaction）：平摊压缩开销；
+4. 会话落盘持久化（SessionDB Persist）；
+5. 记忆同步安全守卫（Memory Sync Invariant）：同步至外部向量库（若轮次被打断则绝对禁止同步）；
+6. 后台记忆与技能智能提炼评审（Background Memory/Skill Review Fork）；
+7. 组装单轮最终产出结果字典（result dict）并安全释放资源。
+
+本模块严禁在模块顶层导入 agent.conversation_loop（防止循环依赖）。
+
+Post-loop turn finalization for ``run_conversation``.
 
 Budget summary, trajectory save, persist, diagnostics, response transforms, result
 assembly, steer drain, memory/skill review. Synchronous, single return. ``logger`` is
@@ -297,6 +309,13 @@ def _micro_compact_after_turn(agent, messages, final_response, logger) -> None:
                 _compressor._flush_scan_cursor_invalidated = False
                 agent._db_flush_scan_prefix = None
             if isinstance(_compacted, list) and _compacted:
+                # 【核心 Python 语法点：切片赋值 原地修改（In-Place Slice Assignment）】
+                # 为什么必须使用 `messages[:] = _compacted`，而绝对不能写成 `messages = _compacted`？
+                # 原因剖析：
+                # 如果写 `messages = _compacted`，仅改变了当前函数内部局部变量的引用指针，
+                # 外部调用者（如 finalize_turn、run_conversation 及 SessionDB）持有的原始列表完全不受影响（产生脏数据与失效压缩）；
+                # 而采用切片赋值 `messages[:] = _compacted`，会直接在原内存地址上就地修改列表内容（In-Place Mutation），
+                # 从而让全局所有持有该 messages 引用的模块瞬间同步感知到压缩后的最新消息视图！
                 messages[:] = _compacted
             if _before != len(messages):
                 logger.info("Micro-compaction: %d -> %d messages", _before, len(messages))
@@ -487,7 +506,16 @@ def finalize_turn(
     _turn_exit_reason, _pending_verification_response=None,
     _pending_verification_response_previewed=False,
 ):
-    """Run the post-loop finalization and return the turn ``result`` dict."""
+    """【执行轮次退出后的全量终结收尾 / Run Post-Loop Finalization】
+    在生命周期 Phase 10 执行，串联所有收尾动作并组装输出字典：
+    1. 判定完成状态：检查 interrupted / failed / max_iterations；
+    2. 消息耐久性收尾：若在工具或异常退出点中断，确保最后一条消息在持久化时收敛为合法 assistant 行；
+    3. 微压缩与持久化：触发 _micro_compact_after_turn 并刷新到 SessionDB；
+    4. 记忆同步守卫（Memory Sync Invariant）：若 `interrupted=True`，严防同步到外部知识库；
+    5. 唤醒后台异步复盘（Background Review）：独立线程提炼新的 Memory/Skill；
+    6. 产出包含完整 Token 消耗与成本审计的 `result` 字典。
+
+    Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
 
     final_response, _turn_exit_reason, preserved_verification_fallback = _resolve_budget_fallback(
@@ -595,6 +623,12 @@ def finalize_turn(
     except Exception as exc:
         logger.warning("on_turn_complete notification failed: %s", exc)
 
+    # 【编码防御关键关卡：孤立 UTF-16 代理字符（Surrogates）清洗】
+    # 痛点与背景剖析：
+    # 大模型（如 Ollama、NVIDIA NIM、DeepSeek 等）在生成流式文本或遭遇截断时，偶尔会吐出半个 Unicode 编码（即 U+D800~U+DFFF 范围内的孤立代理对）。
+    # Python 内部虽然允许字符串对象持有这些特殊码点，但只要该字符串尝试被转成标准 UTF-8（如 print 输出到控制台、JSON 序列化、
+    # 发送给 Telegram/Signal 消息客户端），底层 C 库就会瞬间抛出致命的 `UnicodeEncodeError` 导致进程直接崩溃退出！
+    # 解决机制：在响应离开主循环的最外层关卡，统一调用 `_sanitize_surrogates` 将非法孤立代理对替换为合法占位符（U+FFFD），彻底治愈多平台崩溃顽疾。
     # Surrogate chokepoint: RAW SDK text with a lone UTF-16 surrogate crashes downstream
     # consumers (stdout, Telegram ``utf16_len``, JSON); scrub once where it leaves the loop.
     # Class-level surrogate chokepoint (#80366, #55143, #55309, #19819): ``final_response`` is often the RAW

@@ -222,6 +222,8 @@ _COMPRESSION_TIMEOUT_FINAL_RESPONSE = (
 )
 
 
+# 【等待模型响应打断前缀 / Interrupt Waiting For Model Prefix】
+# 稳定前缀，供 ACP 适配器与 TUI 界面匹配识别：将此文本作为任务取消的元数据处理，而非普通 Assistant 回复文本。
 # Stable prefix ACP/TUI match on to treat the text as cancellation metadata, not assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
@@ -229,7 +231,12 @@ INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model r
 def _should_rearm_compression_budget(
     compression_attempts: int, *, completed_compaction_pending: bool, prompt_tokens: int, threshold_tokens: int
 ) -> bool:
-    """True once a provider proves a completed compaction worked: rough estimates cannot
+    """【重新布防压缩重试预算 / Rearm Compression Budget】
+    当模型供应商确认一次完整的上下文压缩（Compaction）已实质性生效时返回 True：
+    本地粗略的 Token 估算绝不能随意重置防颠簸预算（Anti-thrash Budget）；
+    必须同时满足“压缩完成门闩为 True”且“经过校验的真实 Prompt Token 数量处于正数且已降至阈值之下”。
+
+    True once a provider proves a completed compaction worked: rough estimates cannot
     rearm the anti-thrash budget, only the completed-compaction latch plus a positive
     normalized prompt count below the threshold."""
     return bool(
@@ -237,6 +244,13 @@ def _should_rearm_compression_budget(
     )
 
 
+# 【确定性本地异常模块白名单 / Deterministic Local Processing Modules】
+# 机制与痛点剖析：
+# 如果异常回溯栈（Traceback）中出现了这些模块（且没有任何 API 调用网络模块），
+# 说明这是本地纯 Python 逻辑缺陷或类型错误（例如参数解析错误、字符串清洗越界）。
+# 这类错误是 100% 确定性的，对大模型 API 进行网络重试毫无意义，直接报错退出，避免浪费重试配额与 Token。
+# ⚠️ 架构警戒线：绝对不能把 "conversation_loop" 或 "run_agent" 加进这个集合！
+# 因为整个 Agent 系统的任何异常都会穿过这两个核心门面文件；如果加上它们，所有网络超时或偶发错误都会被误判为本地 Bug 而直接放弃重试（参见 issue #66267）。
 # Modules whose presence in a traceback (without any API-call module) marks a
 # deterministic local bug not worth retrying. NEVER add "conversation_loop" or
 # "run_agent": every exception passes through them; _hit_local would be True (#66267)
@@ -248,15 +262,32 @@ _LOCAL_PROCESSING_MODULES = frozenset({
 })
 _API_CALL_MODULES = frozenset({"chat_completion_helpers"})
 
+# 【单用户轮次外层循环异常上限 / Max Outer-loop Exceptions per User Turn】
+# 机制与痛点剖析：
+# 在单个用户对话轮次中，外层未捕获异常的熔断阈值（默认 8 次）。
+# 注意：常规的网络波动、429 限流、模型超时回退均已被内层的重试状态机（TurnRetryState）优雅拦截处理，
+# 只有穿透逃逸（ESCAPE）到最外层循环的未知未知严重异常才会扣减此计数，因此设为较小的 8 次即可有效防止死循环（参见 issue #92450）。
 # Max outer-loop exceptions per user turn before giving up; only exceptions that
 # ESCAPE the inner retry/fallback machinery count, so this can be small (#92450).
 _MAX_OUTER_LOOP_ERRORS = 8
 
 
 def _is_interpreter_shutdown_error(exc: Exception) -> bool:
-    """True for a fatal interpreter-shutdown RuntimeError. The RuntimeError type gate
+    """【判断异常是否由 Python 解释器正在退出引起 / Check for Interpreter Shutdown Error】
+    当进程正在关机（例如用户在终端按下 Ctrl+C、关闭 TUI 窗口或接收到 SIGTERM 终止信号）时，
+    底层运行时抛出的致命 RuntimeError 判定。
+    必须严格限定为 RuntimeError 类型，携带类似文本的普通 ValueError 绝不能误判匹配（参见 issue #93269）。
+
+    True for a fatal interpreter-shutdown RuntimeError. The RuntimeError type gate
     stays here: a ValueError carrying similar text must not match (#93269)."""
     if isinstance(exc, RuntimeError):
+        # ── 解释器终结退出阶段：立即放弃执行（Abandon Immediately） ──
+        # 场景与机制深度剖析：
+        # 当外部主进程正在退出（用户关闭终端 TUI、单次运行任务结束），而当前轮次中
+        # 派生的后台审查守护线程（Daemon Thread）仍在网络飞行中。
+        # 此时如果继续尝试 API 重试、凭据轮换或级联回退均已徒劳无功（线程池会报 "cannot schedule new futures..."），
+        # 且缓冲的 ⚠️/❌ 重试堆栈信息会在 TUI 退出后疯狂刷屏污染用户控制台。
+        # 解决方式：捕获该信号后直接打一行安静的日志并终结轮次：不打印、不喷堆栈、不触发重试。
         # ── Interpreter finalization: abandon immediately ── The process is exiting (TUI quit, SIGTERM,
         # one-shot done) while this turn — typically the post-turn review fork's daemon thread — is
         # mid-flight. Retries, credential rotation, and fallbacks are all futile ("cannot schedule new
@@ -269,7 +300,12 @@ def _is_interpreter_shutdown_error(exc: Exception) -> bool:
 
 
 def _moa_client_consumes_prepared_request(client: Any) -> bool:
-    """True when ``client`` is the in-process MoA facade (only ``MoAChatCompletions`` exposes
+    """【判断客户端是否支持 MoA 预备请求 / Check if Client Consumes Prepared MoA Request】
+    当 client 是进程内 MoA（Mixture-of-Agents）门面时返回 True：
+    只有 MoAChatCompletions 暴露了 prepare() 接口；其他普通客户端即使在 agent.provider 仍为 "moa" 的情况下，
+    强行传递 _moa_prepared_request 也会抛出 TypeError 异常。
+
+    True when ``client`` is the in-process MoA facade (only ``MoAChatCompletions`` exposes
     ``prepare()``; other clients raise TypeError on ``_moa_prepared_request`` even while
     ``agent.provider`` stays ``"moa"``)."""
     completions = getattr(getattr(client, "chat", None), "completions", None)
@@ -300,7 +336,21 @@ def _moa_reference_metrics_for_hook(agent: Any) -> Any:
 
 
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
-    """Append a provider-safe checkpoint and correction to the live turn so role alternation
+    """【在活跃轮次中应用用户纠偏重定向 / Apply Active Turn Redirect】
+    当用户在模型生成过程中输入纠偏指令（如 /redirect 或在桌面端插入新指令）时，
+    向当前会话历史安全追加检查点（Checkpoint）与纠偏内容。
+    
+    必须捍卫的三大系统不变量（CRITICAL INVARIANTS）：
+    1. 思考链剥离（Raw CoT Stripping）：原始的 `<think>...</think>` 思考过程绝对不能进入可重放上下文。
+       否则会被部分大模型当作 Prefill 越狱攻击，引发持续吐出空响应的“空响应风暴”（Empty-response Storms）；
+    2. 严格角色交替守护（Strict Role Alternation）：
+       若当前消息尾部不是 assistant，先追加一个占位 assistant 消息，再追加 user 纠偏；
+       若当前消息尾部已经是 assistant，则将上下文检查点直接折叠进新的 user 消息中，杜绝产生连续两条 assistant；
+    3. UI 视图与 API 载荷彻底解耦（Content vs Api_Content）：
+       对前端 UI（控制台/TUI），消息只展示用户纯净的原话（`content: text`）；
+       对底层 LLM API，消息携带包含被打断现场的完整纠偏脚手架（`api_content: correction`）。
+
+    Append a provider-safe checkpoint and correction to the live turn so role alternation
     holds and cached messages stay byte-identical. INVARIANTS: raw chain-of-thought never enters
     replayable content (inlined CoT reads as a prefill jailbreak and bricks the session with
     empty-response storms); the interruption scaffold is replay text carried only in the user
@@ -1761,7 +1811,17 @@ def run_conversation(
 
 
 def _close_durable_failed_turn(agent, result: Any) -> None:
-    """Append a Hermes-authored assistant boundary when a failed turn left ``user`` as the
+    """【异常失败轮次安全闭合器：坚守严格角色交替不变量】
+    痛点剖析与解决机制：
+    1. 严格角色交替（Strict Role Alternation）：大模型接口要求消息角色必须交替出现（User -> Assistant -> User）。
+       如果某轮次因为安全策略拒绝、重试耗尽或在模型回复前被打断，历史记录的末尾就会停留在 `user` 角色。
+       如果直接保存，用户下一次说话时就会形成连续两条 `user` 消息（[user, user]），直接导致 API 报错拒接！
+    2. 自动垫片闭合：本函数在异常退出时，自动追加一条由系统生成的 Assistant 错误说明行，
+       既落盘保存至 SessionDB，又维护了合法的对话角色拓扑结构。
+    3. 上下文溢出除外（Excluded）：若失败原因是上下文彻底撑爆（context_overflow/compression_exhausted），
+       则绝不追加垫片消息，防止陷入“越爆越塞、越塞越爆”的恶性雪崩循环。
+
+    Append a Hermes-authored assistant boundary when a failed turn left ``user`` as the
     durable conversation tail (in place, on ``result["messages"]`` and in SessionDB).
 
     The terminal-failure paths (content-policy refusal, ``_Trunc.end_turn``, retry exhaustion,

@@ -1,4 +1,14 @@
-"""Per-iteration API request assembly for the conversation turn loop: build ``api_messages``
+"""【单次迭代 API 请求装配器 / Per-Iteration API Request Assembly】
+对话轮次循环中，每一轮模型交互（Iteration）发起前的请求报文组装核心：
+1. 从对话轨迹（Transcript）构建临时的 `api_messages` 副本（绝不污染原始权威历史 `messages`）；
+2. 聚合 MoA（Mixture-of-Agents 混合智能体）参考模型的上下文并追加至用户消息末尾；
+3. 注入仅在发送时生效的临时预填充消息（Prefills）；
+4. 触发 Context Engine（上下文引擎）选择钩子与字符串清洗消毒（Surrogate Sanitization）；
+5. 规范化工具调用（Canonicalization），确保字节级绝对确定性以保活前缀缓存；
+6. 在所有消息变换完成后，在最后一步构建针对当前请求的 Prompt Cache Plan（提示词缓存断点策略）；
+7. 最终评估当前请求的 Token 压力（Request Pressure）。
+
+Per-iteration API request assembly for the conversation turn loop: build ``api_messages``
 from the transcript, append MoA context, inject prefills, run the context-engine selection
 hook and the send-time sanitizers, canonicalize for bit-perfect cache prefixes, build the
 request-local prompt-cache plan LAST (after every transcript mutation), prepare the
@@ -23,7 +33,11 @@ logger = logging.getLogger("agent.conversation_loop")
 
 @dataclass
 class AssembledRequest:
-    """Always ``action == "fallthrough"``; the fields are the iteration locals the assembly
+    """【装配完成的请求数据包 / Assembled Request Payload】
+    包含本次迭代发送给 LLM 所需的全部物料副本（例如带缓存断点的 api_messages、格式化后的 tools_for_api）。
+    权威原始数据（agent.messages 与 agent.tools）保持纯净不受修饰。
+
+    Always ``action == "fallthrough"``; the fields are the iteration locals the assembly
     produces (``api_messages``/``tools_for_api`` are the decorated request copies — the
     canonical ``messages``/``agent.tools`` stay undecorated)."""
 
@@ -108,7 +122,14 @@ def assemble_api_request(
     _plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
     original_user_message: Any, pending_moa_prepared_request: Any, request_logger: Any,
 ) -> AssembledRequest:
-    """Assemble the request in the original order. ORDER IS LOAD-BEARING: cache breakpoints
+    """【装配单次 API 请求完整载荷 / Assemble Full API Request Payload】
+    在生命周期 Phase 4 执行，严格按顺序执行清洗与组装。
+    ⚠️ 顺序具有绝对结构承重性（ORDER IS LOAD-BEARING）：
+    缓存断点（Cache Breakpoints）必须在所有空白归一化（Whitespace Normalization）、
+    孤儿工具结果扫描、纯思考过程剔除/用户消息合并、以及乱码字符剥离之后才能注入！
+    这样才能保证同一行消息在跨轮次传输中字节级恒定，绝不破坏底层前缀缓存（Prompt Caching）。
+
+    Assemble the request in the original order. ORDER IS LOAD-BEARING: cache breakpoints
     are injected only after whitespace normalization, the orphan sweep, thinking-only drop /
     user merge and surrogate stripping, so the same row's bytes never vary across turns."""
     from agent.conversation_loop import (

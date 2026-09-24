@@ -105,6 +105,29 @@ flowchart TD
 
 ---
 
+### 2.1 外部高层调用入口：`chat()` vs. `run_conversation()`
+
+对于上层调用方（如测试脚本、CLI 交互或网关），`AIAgent` 暴露了两个不同粒度的核心入口方法：
+
+```python
+# 1. 快捷简化接口 (适合快速测试或单轮问答，直接返回最终答复字符串)
+response = agent.chat("修复 main.py 中的 bug")
+
+# 2. 完整工程级接口 (支持丰富参数，返回包含消息历史、元数据、Token 消耗等的字典)
+result = agent.run_conversation(
+    user_message="修复 main.py 中的 bug",
+    system_message=None,           # 缺省时自动构建或从缓存恢复
+    conversation_history=None,     # 缺省时从 SessionDB 恢复
+    task_id="task_abc123"          # 轮次追踪任务 ID
+)
+```
+
+**底层调用关系与封装机制**：
+- `agent.chat()` 实际上只是 `agent.run_conversation()` 的轻量包装器（Wrapper），在执行完成后从返回的完整 `result` 字典中提取 `final_response` 字段作为文本返回。
+- 无论外部从哪个客户端（CLI、TUI、Desktop、Web 或 Gateway）发起交互，核心引擎底层**全部统一由 `run_conversation()` 驱动**。
+
+---
+
 
 ### 语法伴读 A：`AIAgent` 的方法为什么分散在多个文件？
 
@@ -313,12 +336,44 @@ for f in fields(verdict):
 - 组装消息列表：系统提示词 + 历史上下文 + 临时注入指令（Ephemeral Prompts）。
 - 装饰 Prompt 缓存标记：根据当前提供商策略（Anthropic 缓存断点、DeepSeek 自动前缀等）重新挂载 `cache_control`。
 
+#### 知识拓展：三大底层 API 模式（API Modes）与 4 级解析阶梯
+在装配网络请求载荷时，Hermes 抹平了业界不同大模型厂商迥异的协议规范，将其统一收敛为三种底层执行模式：
+
+| API Mode | 适用厂商与协议 | 底层 Client 封装 | 协议载荷与工具格式特征 |
+| :--- | :--- | :--- | :--- |
+| `chat_completions` | OpenAI 标准接口（DeepSeek, OpenRouter, Qwen, 本地 Ollama/vLLM） | `openai.OpenAI` | 业界通用标准：`role`/`content`/`tool_calls` 结构 |
+| `codex_responses` | OpenAI Codex / Responses API 实验接口 | `openai.OpenAI` (带 Responses 格式化) | 原生输入输出 items 树形结构与上下文检查点 |
+| `anthropic_messages` | Claude 原生 Messages API | `anthropic.Anthropic` (经由适配器) | 原生 content blocks 结构；支持显式挂载 `cache_control` 断点 |
+
+**4 级模式解析优先级（Mode Resolution Order）**：
+系统在决定使用哪种模式时，按如下优先级顺次匹配：
+1. `AIAgent` 构造函数显式传入的 `api_mode` 参数（最高优先级）；
+2. Provider 厂商特征识别（如 `anthropic` 厂商 ➔ 自动选用 `anthropic_messages`）；
+3. Base URL 启发式规则（如 Base URL 包含 `api.anthropic.com` ➔ 选用 `anthropic_messages`）；
+4. 默认兜底：回退为标准 `chat_completions`。
+
+*设计精髓*：无论底层是哪种 API 模式，在进入单轮循环之前，历史消息统一以标准格式存在；发送前按模式转换，接收到响应后在阶段 8（`normalize_model_response`）再次标准化为统一定义，从而实现核心状态机与模型协议的高度解耦。
+
 ### 阶段 4：`run_preflight_gate`（上下文门禁与自适应压缩）
 - 依据当前配置和请求压力判断是否需要压缩。不要把网关会话卫生检查与 agent 压缩器的阈值混成这个函数内固定的“50% / 85% 两级门禁”。
 - 若触发压缩，调用 `../../../agent/context_compressor.py` 针对历史早期轮次进行有损摘要压缩，保留最近 N 条关键消息，降低超限概率；估算与服务端计数可能不同，仍需要后面的溢出恢复路径。
 
 ### 阶段 5：`announce_api_call`（交互反馈）
 - 唤醒 UI 层回调：启动命令行 Spinner 或向前端推送 `status: thinking` 事件。
+
+#### 核心机制：主循环的 8 大全景回调矩阵（Callback Surfaces）
+后端主循环在思考、调用 API、执行工具、向用户提问时，如何与终端控制台（CLI/TUI）、桌面应用（Desktop Electron）以及 IDE（ACP）进行实时富交互？秘密就在于 `AIAgent` 挂载的 8 大全景回调函数：
+
+| 回调名称 (Callback) | 触发时机与生命周期 | 典型消费场景与 UI 表现 | 挂载与消费端 |
+| :--- | :--- | :--- | :--- |
+| `stream_delta_callback` | 每接收到一个流式 Token 时立即触发 | 字符级打字机效果、实时文字推流 | CLI, Web UI |
+| `thinking_callback` | 模型开始/结束思考生成时触发 | 终端光标动画切换、Desktop 思考状态指示灯 | CLI, Desktop |
+| `reasoning_callback` | 收到 Extended Thinking（`<thought>` 思考链）时触发 | 终端/桌面端的彩色折叠思考面板动态渲染 | CLI, Gateway |
+| `tool_progress_callback` | 工具执行开始前与执行完成后触发 | 终端命令行 Spinner 动画、桌面工具执行进度条 | CLI, Gateway |
+| `tool_gen_callback` | 从流式响应中刚解析出工具名和参数时触发 | 终端在工具执行前提前预览即将运行的操作 | CLI |
+| `clarify_callback` | 触发危险命令审批或 `clarify` 向用户交互提问时 | CLI 交互提示符、Desktop 审批确认弹窗 | CLI, Desktop, Gateway |
+| `step_callback` | 一个完整 Agent Turn 完结后触发 | Gateway 步骤状态追踪、ACP (IDE) 进度上报 | Gateway, ACP Adapter |
+| `status_callback` | Agent 整体生命周期状态变动时触发 | 跨进程客户端监听 Agent 状态（空闲/思考/执行） | ACP Adapter, Desktop |
 
 ### 阶段 6：`_run_api_retry_loop`（网络传输与自适应重试）
 在重试循环中执行网络调用：
@@ -328,6 +383,22 @@ for f in fields(verdict):
   - `429 Rate Limit`：触发指数带抖动退避（`jittered_backoff`）。
   - `413 Request Entity Too Large`：即使通过了预检，若 Provider 报错超限，立即降低阈值触发紧急在位压缩，并装载重启标志。
   - `5xx / 401 故障转移 (Failover)`：激活备用模型列表中的下一个 Provider，通过 `_arm_fallback_restart` 同步系统提示词并从第 0 步重启该迭代。
+
+#### 架构设计：双线程可中断调用模型（Interruptible API Call）
+网络请求由 `_interruptible_api_call()` 驱动，它通过主线程与后台工作线程的解耦，实现了丝滑的用户打断机制：
+
+```text
+┌────────────────────────────────────────────────────────┐
+│ 主线程 (Main Thread)               后台 API 线程 (Worker Thread)│
+│                                                        │
+│  wait on:                               HTTP POST 请求         │
+│   • response_ready (响应就绪)   ────▶    发往大模型 Provider    │
+│   • interrupt_event (用户打断)                           │
+│   • timeout (网络超时)                                  │
+└────────────────────────────────────────────────────────┘
+```
+- **打断逻辑**：当用户在界面中按 `Ctrl+C`、发送了新消息抢占会话、或输入 `/stop` 指令时，主线程的 `interrupt_event` 被瞬间置位。
+- **零污染放弃**：主线程直接放弃（abandon）后台仍在等待的 HTTP 连接，直接抛弃未完成的残缺响应。**这保证了绝不会有半截残缺代码或被掐断的推理被错误写入消息历史**，也绝不会触发外部记忆同步。
 
 ### 阶段 7：`apply_retry_restarts`（重启状态判定）
 - 检查是否有重定向（Redirect）或故障转移重启请求。若有，累加 `restart_count`（防止死循环耗尽预算），并安全进入下一轮迭代。
@@ -463,13 +534,13 @@ print(demo())
 
 **收尾也分层**：一轮完成后保存消息、可能触发记忆审核；会话结束时才做相应生命周期清理。理解 `finally` 与上下文管理器后，再看租约释放、上下文恢复，比一开始背所有清理函数更有效。
 
-## 4. 四大核心系统级设计不变量（Architectural Invariants）
+## 4. 五大核心系统级设计不变量（Architectural Invariants）
 
-以下是本章选取的四项约束，并非项目全部不变量；还必须注意消息角色顺序、工具调用与结果配对，以及 profile 隔离。缓存规则允许上下文压缩这一明确例外。
+以下是贯穿整个 Hermes Agent 系统的五项核心设计戒条。理解它们是看懂主循环各种“奇怪约束”（如为什么不能随便插消息、为什么改配置不立刻重构 Prompt）的钥匙：
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│                        Hermes Agent 四大设计不变量                           │
+│                        Hermes Agent 五大设计不变量                           │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ 1. Prompt Caching is Sacred     │ 前缀缓存神圣不可侵犯：Prompt 字节级不变，   │
 │                                │ 工具顺序严格冻结，界面切换追加尾部注记。    │
@@ -482,6 +553,9 @@ print(demo())
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ 4. Segment Planner Concurrency │ 工具安全分段执行：并发安全只读并行，        │
 │                                │ 路径冲突分段，交互串行，约束副作用顺序。  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ 5. Strict Role Alternation     │ 消息严格交替铁律：User/Assistant 严格交替， │
+│                                │ 工具结果一一配对，严禁同角色连续注入。      │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -510,6 +584,22 @@ print(demo())
   - 引入 `SegmentPlanner`：
     - **Parallel Segment**：满足准入条件的并发段（如 `read_file`, `web_search`, `search_files`）；路径不冲突的文件写入也可能获准并发；
     - **Sequential Barrier**：如 `clarify`、未获准并发或参数无法解析的调用；先完成前面的段，再按顺序执行。涉及写入的路径重叠会结束当前并发段，不能概括为“所有写操作都串行”。
+
+### Invariant 5: Strict Role Alternation & Tool Pairing（严格角色交替与工具配对铁律）
+- **背景**：现代主流大模型（特别是 Anthropic Claude 与 OpenAI Responses API）在服务端会对上下文序列进行极其严密的格式状态机校验。一旦消息出现角色重叠或孤立工具结果，服务端会直接拒绝请求（HTTP 400 Bad Request），导致整个会话永久损坏。
+- **内部消息统一格式**：
+  系统内部始终以标准化的 OpenAI 风格消息字典流转：
+  ```python
+  {"role": "system", "content": "..."}
+  {"role": "user", "content": "..."}
+  {"role": "assistant", "content": "...", "tool_calls": [...]}
+  {"role": "tool", "tool_call_id": "call_123", "content": "..."}
+  ```
+- **核心四大铁律**：
+  1. **严格双向交替**：在 `system` 消息之后，整体主干必须严格呈现 `User ➔ Assistant ➔ User ➔ Assistant ...`。
+  2. **严禁连续同角色注入**：严禁连续出现两条 `user` 消息，也严禁连续出现两条 `assistant` 消息。系统绝不允许在循环中途合成并插入虚假的用户指令（Synthetic User Message）。
+  3. **唯有 Tool 角色允许连续多条**：在工具调用阶段，序列必须严格呈现 `Assistant (带 tool_calls) ➔ Tool ➔ Tool ... ➔ Assistant`。**整条链路中，唯有 `role="tool"` 被允许连续并排出现**（对应批量或并发执行的工具执行结果）。
+  4. **ID 严格一一对应**：每一条 `tool` 结果的 `tool_call_id` 必须与紧邻上一条 Assistant `tool_calls` 中声明的 `id` 形成闭环映射，严禁出现游离无主的工具返回。
 
 ---
 

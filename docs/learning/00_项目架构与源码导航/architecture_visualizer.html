@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Hermes Agent 架构全景交互图</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    .flow-badge {
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .flow-badge.active {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 14px -2px rgba(99, 102, 241, 0.4);
+    }
+    .card-node {
+      transition: all 0.25s ease;
+    }
+    .card-node:hover {
+      transform: translateY(-2px);
+      border-color: rgba(99, 102, 241, 0.6);
+      box-shadow: 0 8px 20px -4px rgba(0, 0, 0, 0.1);
+    }
+    .highlight-active {
+      border-color: rgb(99 102 241) !important;
+      background: rgba(99, 102, 241, 0.12) !important;
+    }
+  </style>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-3">
+  <div class="bg-[var(--card)] text-[var(--foreground)] border border-[var(--border)] rounded-2xl p-6 shadow-xl max-w-5xl mx-auto backdrop-blur-md">
+    
+    <!-- 头部与模式切换控制台 -->
+    <div class="flex flex-col md:flex-row md:items-center justify-between border-b border-[var(--border)] pb-5 mb-6 gap-4">
+      <div class="flex items-center space-x-3.5">
+        <div class="w-11 h-11 rounded-2xl bg-gradient-to-tr from-indigo-500 via-purple-500 to-cyan-400 flex items-center justify-center text-white text-xl shadow-md">
+          🏛️
+        </div>
+        <div>
+          <h2 class="text-[var(--foreground)] font-bold text-lg flex items-center gap-2.5">
+            Hermes Agent 现代系统架构流转全景
+            <span class="text-[11px] px-2.5 py-0.5 rounded-full font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">自然流线视图</span>
+          </h2>
+          <p class="text-[var(--muted-foreground)] text-xs mt-0.5">告别机械生硬连线，点击不同交互场景动态点亮全链路数据流</p>
+        </div>
+      </div>
+
+      <!-- 交互场景切换按钮 -->
+      <div class="flex items-center bg-[var(--background)] p-1 rounded-xl border border-[var(--border)] self-start md:self-auto gap-1 text-xs">
+        <button onclick="setFlow('all')" id="btn-all" class="flow-badge active px-3 py-1.5 rounded-lg font-medium text-white bg-indigo-600">全景概览</button>
+        <button onclick="setFlow('gui')" id="btn-gui" class="flow-badge px-3 py-1.5 rounded-lg text-[var(--muted-foreground)] hover:text-[var(--foreground)]">🖥️ 桌面/TUI 流</button>
+        <button onclick="setFlow('dash')" id="btn-dash" class="flow-badge px-3 py-1.5 rounded-lg text-[var(--muted-foreground)] hover:text-[var(--foreground)]">🌐 Dashboard 双通道</button>
+        <button onclick="setFlow('bot')" id="btn-bot" class="flow-badge px-3 py-1.5 rounded-lg text-[var(--muted-foreground)] hover:text-[var(--foreground)]">💬 平台机器人流</button>
+      </div>
+    </div>
+
+    <!-- 6 大层级流线卡片容器 -->
+    <div class="space-y-4">
+
+      <!-- 1. 客户端多端接入层 -->
+      <div class="rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-4" id="layer-clients">
+        <div class="text-xs font-bold text-indigo-400 mb-2.5 flex items-center justify-between">
+          <span>📱 1. 客户端多端接入层 (UI & Client Surfaces)</span>
+          <span class="text-[10px] font-normal text-[var(--muted-foreground)]">TypeScript / Python 多入口</span>
+        </div>
+        <div class="grid grid-cols-2 sm:grid-cols-5 gap-2.5 text-xs">
+          <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)] text-center" id="node-cli">
+            <div class="font-semibold text-indigo-300">💻 经典 CLI</div>
+            <div class="text-[10px] text-[var(--muted-foreground)] mt-0.5">hermes (纯 Python 滚屏命令行)</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)] text-center" id="node-tui">
+            <div class="font-semibold text-indigo-300">📟 终端图形 TUI</div>
+            <div class="text-[10px] text-[var(--muted-foreground)] mt-0.5">hermes --tui (Node/Ink 全屏控制台)</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)] text-center" id="node-desktop">
+            <div class="font-semibold text-indigo-300">🖥️ apps/desktop</div>
+            <div class="text-[10px] text-[var(--muted-foreground)] mt-0.5">Electron 独立桌面端</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)] text-center" id="node-webdash">
+            <div class="font-semibold text-indigo-300">🌐 Web Dashboard</div>
+            <div class="text-[10px] text-[var(--muted-foreground)] mt-0.5">浏览器管理与控制台</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)] text-center col-span-2 sm:col-span-1" id="node-platforms">
+            <div class="font-semibold text-indigo-300">💬 平台机器人</div>
+            <div class="text-[10px] text-[var(--muted-foreground)] mt-0.5">Telegram/Discord/Slack</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 流动指示箭头 -->
+      <div class="flex justify-center -my-2 text-[var(--muted-foreground)] text-xs">↓</div>
+
+      <!-- 2. 协议转换与接入网关层 -->
+      <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 p-4" id="layer-gateways">
+        <div class="text-xs font-bold text-cyan-400 mb-2.5 flex items-center justify-between">
+          <span>🔀 2. 协议转换与接入网关层 (Gateways & Adapters)</span>
+          <span class="text-[10px] font-normal text-[var(--muted-foreground)]">stdio / WebSocket / HTTP</span>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)]" id="node-rpc">
+            <div class="font-semibold text-cyan-300 flex items-center justify-between">
+              <span>⚡ tui_gateway</span>
+              <span class="text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">JSON-RPC</span>
+            </div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">负责 TUI/Desktop 会话管理、事件推送与双向交互审批</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)]" id="node-http">
+            <div class="font-semibold text-cyan-300 flex items-center justify-between">
+              <span>🌐 web_server.py</span>
+              <span class="text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">FastAPI</span>
+            </div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">提供 Web 控制台管理路由；集成 pty_bridge 桥接后台 ui-tui 承载聊天终端</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)]" id="node-msggateway">
+            <div class="font-semibold text-cyan-300 flex items-center justify-between">
+              <span>🛡️ gateway/run.py</span>
+              <span class="text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">Multi-Channel</span>
+            </div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">多平台授权认证、消息路由及 run_agent_cache Agent 缓存复用</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 流动指示箭头 -->
+      <div class="flex justify-center -my-2 text-[var(--muted-foreground)] text-xs">↓</div>
+
+      <!-- 3. Agent 核心编排与状态机 -->
+      <div class="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4" id="layer-core">
+        <div class="text-xs font-bold text-amber-400 mb-2.5 flex items-center justify-between">
+          <span>🏛️ 3. Agent 核心编排与状态机 (Core Engine)</span>
+          <span class="text-[10px] font-normal text-[var(--muted-foreground)]">狭腰架构核心</span>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)] text-center" id="node-facade">
+            <div class="font-semibold text-amber-300">🏛️ run_agent.py (AIAgent)</div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">Facade 门面，组合 14 个专用功能 Mixin；支持轻量断开 release_clients</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)] text-center" id="node-turnfacade">
+            <div class="font-semibold text-amber-300">🛡️ agent/turn_facade.py</div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">admit_durable_turn_lease 跨进程排他租约门禁与活跃度看门狗心跳</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)] text-center" id="node-loop">
+            <div class="font-semibold text-amber-300">⚙️ agent/conversation_loop.py</div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">_LoopState 数据类驱动；9 大解耦执行阶段反射调用调度</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 流动指示箭头 -->
+      <div class="flex justify-center -my-2 text-[var(--muted-foreground)] text-xs">↓</div>
+
+      <!-- 4. 运行时能力服务 -->
+      <div class="rounded-xl border border-purple-500/20 bg-purple-500/5 p-4" id="layer-services">
+        <div class="text-xs font-bold text-purple-400 mb-2.5 flex items-center justify-between">
+          <span>🧠 4. 运行时能力服务 (Runtime Services)</span>
+          <span class="text-[10px] font-normal text-[var(--muted-foreground)]">模型 / 提示词 / 上下文压缩</span>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)]" id="node-provider">
+            <div class="font-semibold text-purple-300">🧠 运行时模型与凭据解析 (runtime_provider.py)</div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">API 模式与凭据池路由解析；会话循环驱动 Failover 故障转移与流式生成</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)]" id="node-prompt">
+            <div class="font-semibold text-purple-300">📑 提示词组装与前缀保活</div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">Prompt Caching is sacred：逐字节复用已有前缀，界面切换尾部注记</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)]" id="node-compression">
+            <div class="font-semibold text-purple-300">🗜️ 上下文引擎体系 (context_engine.py)</div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">ContextEngine(ABC) 规范抽象；默认 ContextCompressor 实现三级动态微压缩</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 流动指示箭头 -->
+      <div class="flex justify-center -my-2 text-[var(--muted-foreground)] text-xs">↓</div>
+
+      <!-- 5. 工具分段调度与执行沙箱 -->
+      <div class="rounded-xl border border-rose-500/20 bg-rose-500/5 p-4" id="layer-tools">
+        <div class="text-xs font-bold text-rose-400 mb-2.5 flex items-center justify-between">
+          <span>🛠️ 5. 工具体系与执行环境 (Tools & Environments)</span>
+          <span class="text-[10px] font-normal text-[var(--muted-foreground)]">SegmentPlanner 安全分流</span>
+        </div>
+        <div class="space-y-2.5 text-xs">
+          <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)] flex flex-col sm:flex-row sm:items-center justify-between gap-2" id="node-planner">
+            <span class="font-semibold text-rose-300">⚡ SegmentPlanner 分段规划调度器</span>
+            <span class="text-[11px] text-[var(--muted-foreground)]">单个调用直通；批量调用切分【并发段 (只读 / 路径不冲突写)】与【串行段 (路径冲突开启新段 / 屏障 clarify)】</span>
+          </div>
+          <div class="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs">
+            <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)]" id="node-inlinetool">
+              <div class="font-semibold text-rose-300">1. 内联状态工具</div>
+              <div class="text-[10px] text-[var(--muted-foreground)] mt-0.5">todo, session_search</div>
+            </div>
+            <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)]" id="node-delegate">
+              <div class="font-semibold text-rose-300">2. 子 Agent 派发</div>
+              <div class="text-[10px] text-[var(--muted-foreground)] mt-0.5">delegate_task 线程池会话</div>
+            </div>
+            <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)]" id="node-ctxmemtool">
+              <div class="font-semibold text-rose-300">3. 上下文与记忆</div>
+              <div class="text-[10px] text-[var(--muted-foreground)] mt-0.5">context_engine / 记忆中枢</div>
+            </div>
+            <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)]" id="node-builtintool">
+              <div class="font-semibold text-rose-300">4. 通用工具注册表</div>
+              <div class="text-[10px] text-[var(--muted-foreground)] mt-0.5">model_tools / registry</div>
+            </div>
+            <div class="card-node bg-[var(--card)] p-2.5 rounded-xl border border-[var(--border)]" id="node-exttool">
+              <div class="font-semibold text-rose-300">5. 浏览器 & MCP</div>
+              <div class="text-[10px] text-[var(--muted-foreground)] mt-0.5">browser_tool / mcp_tool</div>
+            </div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-2 rounded-xl border border-[var(--border)] text-center text-[11px]" id="node-env">
+            <span class="font-semibold text-rose-300">💻 终端沙箱执行后端 (tools/environments/)</span>: Local 本地 / Docker 容器 / 远程 SSH / Modal 云容器 (通用工具执行目标)
+          </div>
+        </div>
+      </div>
+
+      <!-- 流动指示箭头 -->
+      <div class="flex justify-center -my-2 text-[var(--muted-foreground)] text-xs">↓</div>
+
+      <!-- 6. 数据持久化与记忆中枢 -->
+      <div class="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4" id="layer-storage">
+        <div class="text-xs font-bold text-emerald-400 mb-2.5 flex items-center justify-between">
+          <span>💾 6. 数据持久化与记忆中枢 (Persistence & Memory)</span>
+          <span class="text-[10px] font-normal text-[var(--muted-foreground)]">SQLite 增量写入 & 记忆安全</span>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)]" id="node-sessiondb">
+            <div class="font-semibold text-emerald-300">🗄️ SQLite 会话存储 (hermes_state.py)</div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">~/.hermes/state.db 增量入库；FTS5 全文索引；精确导出轮次边界 {turn_id, user_idx}</div>
+          </div>
+          <div class="card-node bg-[var(--card)] p-3 rounded-xl border border-[var(--border)]" id="node-memory">
+            <div class="font-semibold text-emerald-300">🧬 长期记忆中枢 (memory_manager.py)</div>
+            <div class="text-[11px] text-[var(--muted-foreground)] mt-1">Memory Sync Invariant：被打断轮次跳过轮次末自动同步 (_sync_external_memory_for_turn)</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- 底部场景说明文字 -->
+    <div class="mt-5 pt-3.5 border-t border-[var(--border)] text-xs text-[var(--muted-foreground)] flex items-center justify-between" id="scenario-desc">
+      <span>💡 当前展示：<b>系统全景总览</b>。所有客户端通过专用网关汇聚至 AIAgent 核心与执行体系。</span>
+    </div>
+
+  </div>
+
+  <script>
+    const flows = {
+      all: {
+        activeNodes: [],
+        desc: "💡 当前展示：<b>系统全景总览</b>。所有客户端通过专用网关汇聚至 AIAgent 核心与执行体系。"
+      },
+      gui: {
+        activeNodes: ['node-desktop', 'node-tui', 'node-rpc', 'node-facade', 'node-turnfacade', 'node-loop', 'node-provider', 'node-planner', 'node-sessiondb'],
+        desc: "🖥️ <b>桌面与 TUI 链路</b>：apps/desktop (WebSocket) 或 ui-tui (stdio) ➔ tui_gateway (RPC) ➔ AIAgent (Turn Lease) ➔ 核心循环 ➔ state.db。"
+      },
+      dash: {
+        activeNodes: ['node-webdash', 'node-http', 'node-tui', 'node-rpc', 'node-facade', 'node-turnfacade', 'node-loop'],
+        desc: "🌐 <b>Dashboard 双通道链路</b>：聊天窗口通过 Web PTY 桥接拉起后台 ui-tui 走 stdio RPC 接入；管理/设置页面走 web_server.py HTTP REST API。"
+      },
+      bot: {
+        activeNodes: ['node-platforms', 'node-msggateway', 'node-facade', 'node-turnfacade', 'node-loop', 'node-planner', 'node-sessiondb', 'node-memory'],
+        desc: "💬 <b>多平台机器人链路</b>：Telegram/Discord ➔ gateway (鉴权与 run_agent_cache 复用) ➔ AIAgent ➔ 工具执行 ➔ 记忆同步守卫入库。"
+      }
+    };
+
+    function setFlow(flowKey) {
+      // Toggle button states
+      document.querySelectorAll('.flow-badge').forEach(btn => {
+        btn.classList.remove('active', 'bg-indigo-600', 'text-white');
+        btn.classList.add('text-[var(--muted-foreground)]');
+      });
+      const activeBtn = document.getElementById('btn-' + flowKey);
+      if (activeBtn) {
+        activeBtn.classList.add('active', 'bg-indigo-600', 'text-white');
+        activeBtn.classList.remove('text-[var(--muted-foreground)]');
+      }
+
+      // Reset all node highlights
+      document.querySelectorAll('.card-node').forEach(node => {
+        node.classList.remove('highlight-active');
+      });
+
+      const flow = flows[flowKey];
+      if (flow && flow.activeNodes.length > 0) {
+        flow.activeNodes.forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.classList.add('highlight-active');
+        });
+      }
+
+      document.getElementById('scenario-desc').innerHTML = `<span>${flow.desc}</span>`;
+    }
+  </script>
+</body>
+</html>

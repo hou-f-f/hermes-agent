@@ -1,4 +1,13 @@
-"""Pre-API pressure gate for the conversation turn loop: the Ollama runtime-context floor,
+"""【API 预调用守卫网关 / Pre-API Pressure Gate】
+对话轮次循环中调用大模型 API 之前的安全预检与上下文压力闸门：
+1. Ollama 本地模型运行时上下文下限守卫（防止本地小上下文模型因为加载了庞大工具定义而直接崩盘）；
+2. 供应商上下文溢出（Context Overflow）重试恢复布防；
+3. 压缩收益不足阻断器（Insufficient-progress Blocker）：对比完整请求 Token 压力，防止压缩后 Token 几乎没降却陷入无限重试；
+4. 调度 turn_preflight.run_preflight_compression 执行前置微压缩或全量压缩。
+
+本模块严禁在模块顶层导入 agent.conversation_loop（防止循环引用）。
+
+Pre-API pressure gate for the conversation turn loop: the Ollama runtime-context floor,
 the provider-overflow re-check arming, the insufficient-progress blocker (compares fully
 assembled requests, not raw ``messages``) and the call into
 ``turn_preflight.run_preflight_compression``. Nothing here imports
@@ -26,7 +35,18 @@ def run_preflight_gate(
     _preflight_compression_blocked: Any, _provider_overflow_recovery_pending: Any,
     _last_preflight_pressure: Any,
 ) -> PreflightGateVerdict:
-    """Run the pre-API guard chain in the original order. ``_last_preflight_pressure`` is
+    """【执行 API 调用前置守卫链 / Run Pre-API Guard Chain】
+    在生命周期 Phase 2 执行，按严格顺序执行三道防线：
+    1. Ollama 上下文门槛检查：若本地模型上下文甚至放不下 Hermes 工具定义，立即阻断并退还迭代预算；
+    2. 上下文压力（Request Pressure）评估：对比阈值决定是否启动前置压缩（Preflight Compression）；
+    3. 压缩收益防死锁检测：如果上一次压缩后 Token 数量没有实质性下降（insufficient progress），
+       则阻断本轮继续压缩，防止 Agent 在同一个轮次内死循环消耗压缩配额。
+    
+    参数说明：
+    - `request_pressure_tokens`: 包含全量 System Prompt、历史消息和工具声明的精确 Token 预估值。
+    - `_last_preflight_pressure`: 在此函数中被消费（置为 None），仅在发生实质性压缩后重新布防。
+
+    Run the pre-API guard chain in the original order. ``_last_preflight_pressure`` is
     consumed here (set to None) and re-armed only by a compression pass, so a blocked
     preflight never compares against a stale figure."""
     from agent.conversation_loop import _ollama_context_limit_error

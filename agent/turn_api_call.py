@@ -1,4 +1,15 @@
-"""The provider call for the conversation turn's retry loop: ``nous_rate_limit_guard`` (skip
+"""【模型提供商 API 调用执行器 / Model Provider API Call Executor】
+对话轮次重试循环中与底层大模型网关直接通信的执行中枢：
+1. nous_rate_limit_guard：速率限制守卫，检测到跨会话 Nous Portal 限流时自动挂起规避；
+2. perform_api_call：核心调用分发，负责判断是否启用流式传输（Streaming）、
+   MoA 预备请求握手、包裹 LLM 执行中间件（Middleware Pipeline）、
+   管理 _model_request_active 活跃标志锁以支持双线程实时中断打断（_interruptible_api_call），
+   以及裁决“模型返回”与“用户中途纠偏重定向（Redirect）”并发相撞时的冲突解决；
+3. handle_api_interrupt：捕获请求中途触发的 InterruptedError 并安全清理临时现场。
+
+本模块严禁在模块顶层导入 agent.conversation_loop（防止循环依赖）。
+
+The provider call for the conversation turn's retry loop: ``nous_rate_limit_guard`` (skip
 the attempt while another session's Nous Portal rate limit is active), ``perform_api_call``
 (streaming decision, MoA prepared-request handshake, LLM execution middleware wrapper, the
 redirect ``_model_request_active`` bracket and the response-vs-redirect crossing check) and
@@ -35,7 +46,12 @@ def stop_thinking_spinner(agent: Any, thinking_spinner: Any) -> None:
 
 @dataclass
 class ApiCallVerdict:
-    """``action``: ``"fallthrough"`` (``response`` is ready for verification) or ``"break"``
+    """【API 调用裁决结果 / API Call Verdict】
+    ``action`` 取值说明：
+    - ``"fallthrough"``：调用成功，响应数据进入后续校验（check_api_response）与工具执行；
+    - ``"break"``：中途被用户纠偏（Redirect）击穿，丢弃过期响应，立即重建请求并重新发起。
+
+    ``action``: ``"fallthrough"`` (``response`` is ready for verification) or ``"break"``
     (a redirect crossed the response — rebuild armed on ``_retry`` or ``interrupted``)."""
 
     action: str
@@ -121,6 +137,12 @@ def perform_api_call(
 
     from hermes_cli.middleware import run_llm_execution_middleware
 
+    # 【并发安全防护机制：nullcontext 与重定向锁】
+    # 语法点：Python 的 contextlib.nullcontext() 是一个空上下文管理器（No-op Context Manager）。
+    # 当 _redirect_lock 为 None（非并发环境）时，利用 nullcontext() 避免编写冗长混乱的 if/else 上下文判断，
+    # 统一使用 `with _bracket:` 安全加锁。
+    # 架构意图：_model_request_active 标记当前正在网络 I/O 阻塞中，必须在持锁状态下设置，
+    # 严防多线程下外部传入的 redirect() 读到“半切换”状态的脏标记。
     # The ``_model_request_active`` bracket is taken under the redirect lock when one exists,
     # so redirect() can't observe a half-toggled flag.
     _model_request_active = getattr(agent, "_model_request_active", None)
@@ -145,6 +167,11 @@ def perform_api_call(
                 bool(agent._pending_redirect) if _redirect_lock is not None
                 else agent._has_pending_redirect()
             )
+    # 【经典跨线程竞争条件：响应与重定向交叉碰撞（Race Condition）】
+    # 痛点剖析：大模型 API 返回完整响应（线程 A）的瞬间，用户可能恰好在聊天端输入了新的纠偏指令（线程 B）。
+    # 此时如果直接采纳大模型的旧响应，用户的纠偏就会被遗漏丢失。
+    # 解决机制：检测到相撞后，果断丢弃已经过时的旧模型响应（stop_thinking_spinner），
+    # 触发 `restart_with_redirected_messages`，将用户纠偏作为最新输入无缝重建并重新发起请求！
     if _redirect_crossed_response:
         # Response and redirect can cross threads: discard the now-stale
         # response and rebuild from the correction rather than lose it.

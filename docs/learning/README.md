@@ -18,7 +18,7 @@
 
 | 序号 | 专题模块 | 核心源码位置 | 学习文档与资源 | 状态 |
 | :--- | :--- | :--- | :--- | :--- |
-| **00** | **项目架构与源码导航** | 多入口、`agent/`、`tools/`、会话与插件 | [当前架构、数据流与学习检查点](<00_项目架构与源码导航/architecture.md>) | 📝 文档已编写 |
+| **00** | **项目架构与源码导航** | 多入口、`agent/`、`tools/`、会话与插件 | [当前架构、数据流与学习检查点](<00_项目架构与源码导航/architecture.md>)<br/>[系统全景交互式可视化组件](00_项目架构与源码导航/architecture_visualizer.html) | 📝 文档已编写 |
 | **01** | **Agent Loop 核心机制** | `run_agent.py`<br/>`agent/turn_facade.py`<br/>`agent/conversation_loop.py`<br/>`agent/turn_*.py` | [Agent Loop 内部机制深度学习手册](01_Hermes Agent Loop 内部机制深度学习手册/agent_loop_internals_manual.md)<br/>[交互式架构可视化组件](01_Hermes Agent Loop 内部机制深度学习手册/agent_loop_visualizer.html) | 📝 文档已编写 |
 | **02** | **提示词组装与前缀缓存保活** | `agent/prompt_builder.py`<br/>`agent/system_prompt.py`<br/>`agent/prompt_caching.py` | *Prompt Caching is Sacred* 专题 | ⏳ 规划中 |
 | **03** | **工具分段规划与安全调度** | `agent/turn_tool_round.py`<br/>`model_tools.py`<br/>`tools/registry.py` | *SegmentPlanner* 并发与串行屏障机制 | ⏳ 规划中 |

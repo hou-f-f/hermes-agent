@@ -1,4 +1,16 @@
-"""One tool-calling round of the conversation turn loop: validate/cap/dedupe the model's
+"""【单轮工具调用执行中枢 / Tool Calling Round Execution Hub】
+对话轮次循环中负责工具校验、持久化与执行分发的关键模块：
+1. 校验、配额限制与参数去重（Validate/Cap/Dedupe）：清洗大模型生成的工具参数；
+2. 执行前持久化铁律（Persist-Before-Execute Durability Invariant）：
+   在产生任何真实副作用之前，必须先将模型输出的 tool_calls 落盘持久化到会话数据库（SessionDB）中！
+   确保即使破坏性工具中途导致机器重启或进程崩溃，重启恢复（Resume）时也能识别已执行区块；
+3. 工具并发与分段调度：结合 SegmentPlanner 区分只读安全工具与串行屏障工具；
+4. 审批与安全拦截（Guardrail Halts）：响应 tools/approval 的确认请求；
+5. 工具执行后的微压缩（Micro-compaction）：若工具返回超大日志/输出，立即就地压缩。
+
+本模块严禁在模块顶层导入 agent.conversation_loop（防止循环依赖）。
+
+One tool-calling round of the conversation turn loop: validate/cap/dedupe the model's
 tool calls, persist the tool-call turn BEFORE any side effect, execute the tools, honour
 guardrail halts / persistence failures, then compress after tool results. Nothing here
 imports ``agent.conversation_loop`` at module level (cycle) — loop-internal helpers resolve
@@ -25,7 +37,13 @@ _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session
 
 @dataclass
 class ToolRoundVerdict:
-    """``action``: ``"continue"`` (tools ran, next API call), ``"break"`` (turn ends:
+    """【工具轮次执行裁决 / Tool Round Verdict】
+    ``action`` 取值说明：
+    - ``"continue"``：工具执行完毕并将结果写回上下文，驱动主循环进入下一轮模型思考（API 调用）；
+    - ``"break"``：轮次终止（如触发持久化失败、安全守卫硬拦截、工具结果超大触发压缩并收工）；
+    - ``"return"``：直接产出本轮对话的最终结果字典。
+
+    ``action``: ``"continue"`` (tools ran, next API call), ``"break"`` (turn ends:
     persistence failure, guardrail halt, post-tool compression end) or ``"return"``
     (``result`` is the turn's result dict). The other fields are the loop locals the round
     rebinds."""
@@ -50,7 +68,13 @@ def run_tool_round(
     max_compression_attempts: Any, final_response: Any, failed: Any, _turn_exit_reason: Any,
     truncated_tool_call_retries: Any, current_turn_user_idx: Any,
 ) -> ToolRoundVerdict:
-    """Execute one tool round in the exact original order. Persist-before-execute is a
+    """【执行单轮工具调用链 / Execute One Tool Round】
+    在生命周期 Phase 9 执行，严格维持系统设计不变量：
+    1. 执行前持久化（Persist-before-execute）：这是系统的耐久性底线（Durability Invariant）。
+       如果落盘追加失败，必须立即中止轮次，绝不允许仅凭内存临时状态擅自触发带副作用的工具；
+    2. 工具分派与错误包装：每个工具的调用结果严格配对为一条 `role: tool` 消息并附带匹配的 `tool_call_id`。
+
+    Execute one tool round in the exact original order. Persist-before-execute is a
     durability invariant: resume must see the executed block if a destructive tool restarts
     Hermes; a failed canonical append ends the turn rather than running tools from
     process-only state."""
@@ -100,7 +124,12 @@ def run_tool_round(
     )
     append_message(messages, assistant_msg)
 
-    # Mixed batch: error-result invalid calls and drop them from execution.
+    # 【架构不变量 5 实践：工具调用与返回结果严格配对（Tool Pairing Invariant）】
+    # 痛点剖析：大模型单轮次吐出多个工具调用（Mixed Batch），其中某个工具名非法（例如模型幻觉了一个不存在的工具）。
+    # 为什么不能直接从列表里删掉它？
+    # 因为主流大模型 API（Anthropic/OpenAI/DeepSeek）强制要求：assistant 消息中声明的所有 tool_call_id，
+    # 在下一轮消息序列中必须有严格一一对应的 `role: "tool"` 响应！缺一个就会被 API 直接报 400 格式错误拒接！
+    # 解决机制：为非法的工具调用就地构造合法的错误响应帧（Synthesized Error Result），确保消息骨架结构合法。
     if _invalid_batch_calls:
         for tc in _invalid_batch_calls:
             append_message(messages, {
@@ -115,6 +144,15 @@ def run_tool_round(
             tc for tc in assistant_message.tool_calls if tc.function.name in agent.valid_tool_names
         ]
 
+    # 【架构不变量 2 实践：执行前强制持久化铁律（Persist-Before-Execute Durability Invariant）】
+    # 核心原理：
+    # 在真正调用工具（可能会写磁盘、运行脚本、删文件等产生副作用）之前，必须先将模型要执行的意图消息
+    # 刷入底层的 SQLite SessionDB 数据库！
+    # 痛点防范：
+    # 如果一个带有破坏性的工具运行到一半导致操作系统断电或 Hermes 崩溃，
+    # 系统在重启恢复会话（Resume）时，能够精准知道崩溃前系统下发了哪些命令，避免状态不一致。
+    # 关键防线：如果落盘持久化失败（如磁盘写满或数据库被锁），宁可立即终止本轮对话（_verdict("break")），
+    # 也绝不基于内存纯临时状态去冒失执行带副作用的工具！
     # Persist the tool-call turn before any tool side effects so resume sees the executed
     # block if a destructive tool restarts Hermes.
     try:
