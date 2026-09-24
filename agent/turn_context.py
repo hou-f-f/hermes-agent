@@ -987,7 +987,22 @@ def build_turn_context(
     install_safe_stdio, sanitize_surrogates, summarize_user_message_for_log, set_session_context,
     set_current_write_origin, ra, moa_active: bool=False,
 ) -> TurnContext:
-    """Run the once-per-turn setup and return the loop's input context.
+    """【构建单轮对话执行上下文（Turn 序章 / Prologue）】
+    执行每轮对话开始前的一次性环境配置与状态预检，返回外层 Agent 循环所需的 TurnContext 对象。
+    
+    关键架构意图与顺序铁律（Order Matters）：
+    1. 消除循环导入：通过高阶函数传入辅助函数（install_safe_stdio、restore_or_build_system_prompt 等），
+       避免 turn_context 与 conversation_loop 产生循环依赖。
+    2. 严格的执行顺序依赖（参见 issue #45499）：
+       数据库 Session 行的创建必须严格发生在系统提示词（System Prompt）恢复或构建完成之后！
+       如果在系统提示词就绪前创建 Session 行，会导致写入 system_prompt=NULL，使得网关复用时误判提示词丢失，
+       触发“stored system prompt is null; rebuilding from scratch”，从而彻底毁掉首轮的大模型前缀缓存（Prefix Cache Miss）。
+    3. 守护管道安全（Safe Stdio）：先安装安全 stdio 管道，防止在 systemd、后台守护进程或管道破裂时抛出 BrokenPipeError 崩溃。
+    4. 会话轮转与上下文压缩预检：调用 recover_rotated_compression_session 恢复轮转后的子会话历史，
+       并在进入大模型调用前通过 run_turn_start_compaction 运行前置微压缩或空闲压缩。
+    5. 记忆预取与外挂注记：预取向量记忆（ext_prefetch_cache）与插件用户上下文，准备后续注入 API 传输拷贝。
+
+    Run the once-per-turn setup and return the loop's input context.
 
     Helpers are passed in to avoid an import cycle with ``agent.conversation_loop``.
     Order matters: the DB session row is created only AFTER the system prompt is built
@@ -1176,7 +1191,24 @@ def build_api_messages(
     agent: Any, messages: List[Dict[str, Any]], *, current_turn_user_idx: Any,
     ext_prefetch_cache: Any, plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """Build the wire copy of ``messages`` for one API call plus the effective system
+    """【构建单次大模型 API 调用的网络传输拷贝（Wire Messages）】
+    生成单次大模型请求所需的消息列表（api_messages）与生效的系统提示词（effective_system）。
+    返回元组 `(api_messages, effective_system)`。
+
+    前缀缓存不变量（Prompt-cache Invariant）与设计深度：
+    1. 历史消息逐字节复用（api_content 挂斗机制）：
+       历史的 user/assistant 消息在回放时直接复用其绑定的 `api_content` 边车（Sidecar）数据（即上一轮实际发给大模型的确切字节）。
+       这样即使系统内部包含各种格式化处理，历史前缀也绝对保持 byte-stable，确保 100% 命中大模型服务商（Anthropic/OpenAI）的前缀缓存！
+    2. 易变上下文仅在调用时注入（Ephemeral at API time only）：
+       动态记忆检索结果（ext_prefetch_cache）、pre_llm_call 插件钩子上下文及临时系统提示词仅在构建 api_messages 时注入，
+       底层的 messages 历史列表绝不被污染篡改。
+    3. 历史回放规范化（canonicalize_replay_history）：
+       仅对本轮用户消息之前的历史前缀应用时间规范化（以轮次准入时间戳为基准），
+       而本轮最新追加的工具调用/结果属于活跃状态，在跨迭代重试中绝不会被篡改。
+    4. 思考链保留（Reasoning Content）：
+       提取所有历史 Assistant 消息中的 reasoning_content 透传给大模型，确保多轮深度推理思维链得以跨轮次延续。
+
+    Build the wire copy of ``messages`` for one API call plus the effective system
     message. Returns ``(api_messages, effective_system)``.
 
     Prompt-cache invariant: historical user/assistant rows replay their ``api_content``

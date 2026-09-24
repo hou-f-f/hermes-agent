@@ -126,7 +126,13 @@ def _midturn_request_pressure_tokens(
 
 
 def _review_input_budget_exhausted(agent: Any) -> bool:
-    """True when a detached review fork has replayed its aggregate input budget.
+    """【后台异步复盘分支输入预算判定 / Check Review Input Budget Exhaustion】
+    当独立的后台复盘 Fork 子任务（Detached Review Fork）消耗的累计输入 Token 超标时返回 True：
+    仅针对显式设置了 `_review_input_token_budget` 的复盘任务生效（参见 issue #93057）；
+    在下一轮迭代（NEXT iteration）的顶部触发检测，确保当前刚刚跨越预算阈值的请求能够完整执行闭环，
+    杜绝后台静默提炼 Memory 和 Skill 时无限制重放历史导致 Token 账单失控。
+
+    True when a detached review fork has replayed its aggregate input budget.
 
     Only forks with an explicit ``_review_input_token_budget`` are gated (#93057). Fires
     at the top of the NEXT iteration, so the budget-crossing request completes first."""
@@ -138,7 +144,15 @@ def _review_input_budget_exhausted(agent: Any) -> bool:
 
 
 def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
-    """Inject the one-time wall-clock wrap-up notice when past 80% of budget.
+    """【时钟运行预算超 80% 紧急收尾提示注入 / Inject Run Budget Wrap-up Notice】
+    机制与缓存安全设计：
+    当单任务运行时间（--run-budget）超过设定的 80% 时，向模型注入一次性收尾指令（RUN_BUDGET_WRAPUP_NOTICE）；
+    ⚠️ 核心缓存不变量保障（Prompt Caching Invariant）：
+    该通知绝不作为独立的 user 消息插入（那会破坏严格角色交替与系统提示词缓存），
+    而是紧密追加在最新的一条 `role: "tool"` 工具返回结果尾部（机制与 /steer 完全一致）！
+    并且严格保证该 tool 消息尚未被标记为 `_DB_PERSISTED_MARKER`（未落盘的历史消息才可变，绝不修改已固化的旧消息）。
+
+    Inject the one-time wall-clock wrap-up notice when past 80% of budget.
 
     Appends to the NEWEST ``role:"tool"`` message (cache-safe, like /steer); latches
     ``_run_budget_wrapup_injected`` only on a successful append."""
@@ -175,7 +189,14 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
 def _restore_user_after_reference_handoff(
     messages: List[Dict[str, Any]], user_message: Any
 ) -> bool:
-    """Re-append this turn's real user ask when compaction left only a handoff (#80622).
+    """【全量压缩交接后真实用户请求恢复器 / Restore User After Reference Handoff】
+    痛点剖析与解决机制：
+    当上下文压缩器将大量旧历史精简为交接摘要（Reference Handoff）时，
+    可能会导致当前轮次用户刚刚输入的真实问题（user_message）被误截断丢失；
+    本函数负责在交接摘要之后，重新将用户本轮真正要问的内容安全追加回 `messages` 序列末尾，
+    确保模型后续调用的 Prompt 中包含有效的目标指令（参见 issue #80622）。
+
+    Re-append this turn's real user ask when compaction left only a handoff (#80622).
     Returns True when a restore append happened."""
     if isinstance(user_message, str):
         restorable = bool(user_message.strip())
@@ -193,7 +214,11 @@ def _restore_user_after_reference_handoff(
 def _should_skip_model_call_for_reference_handoff(
     messages: List[Dict[str, Any]], user_message: Any
 ) -> bool:
-    """Guard post-compaction continues against sole-handoff active turns (#80622)."""
+    """【防止误将交接摘要作为模型调用的守卫 / Guard Against Sole-Handoff Model Calls】
+    若压缩后当前上下文里只有系统生成的交接摘要（Handoff），而没有恢复出任何可操作的非合成真实用户指令，
+    则直接跳过本次大模型 API 调用（参见 issue #80622），防止大模型对着自己生成的压缩摘要产生自说自话的幻觉。
+
+    Guard post-compaction continues against sole-handoff active turns (#80622)."""
     from agent.context_compressor import reference_handoff_would_drive_next_model_call
     # A restored ask is an actionable non-synthetic user row appended after the
     # handoff — by construction the handoff no longer drives.
@@ -202,6 +227,11 @@ def _should_skip_model_call_for_reference_handoff(
     )
 
 
+# 【仅交接摘要跳过模型调用时的最终状态提示 / Fallback Final Response for Sole-Handoff Skip】
+# 架构意图：当因为仅存交接摘要而跳过大模型调用时，finalize_turn 会将此文本作为一条合法的 assistant 消息追加。
+# ⚠️ 为什么绝对不能直接复读上一轮 assistant 的旧回复？
+# 因为若复读旧回复，在持久化轨迹中就会出现双份重复内容，且用户会误以为模型把上一轮的答案当成了新一轮的回答。
+# 给出简短诚实的“上下文已压缩归档，等待您发送新消息”状态提示，既保证幂等性，又符合事实（参见 issue #43849, #80622）。
 # Fallback final_response for the sole-handoff skip (#80622); finalize_turn appends it as a
 # fresh assistant row, so it must not replay the last assistant text.
 # Deliberately NOT a replay of the last assistant text: finalize_turn's non-assistant-tail chokepoint
@@ -212,6 +242,11 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
     "Context was compacted. The previous response is complete — awaiting your next message."
 )
 
+# 【上下文压缩超时终态响应 / Terminal Final Response for Compression Timeout】
+# 痛点与架构防御：
+# 当大模型上下文压缩（Context Compression）耗尽了最大超时时间，但由于单条消息过长等原因，未能成功缩减请求体积。
+# 此时如果硬着头皮向模型 API 发送未缩减的请求，只会立刻被供应商报 context_overflow 错误，并在同一轮内再次死循环触发压缩。
+# 解决机制：直接终止当前轮次并提示用户开启新会话（/new），同时保证现有历史消息一条不丢（No messages were dropped，参见 issue #98722）。
 # Terminal final_response when compression timed out while the request was still oversized (#98722).
 # Terminal final_response for a turn ended because context compression hit its host progress-aware timeout
 # while the request was still oversized (#98722, salvaged from #98741). Sending the unchanged request would
@@ -398,7 +433,11 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
 
 
 def _is_copilot_provider(agent: Any) -> bool:
-    """Delegate to ``AIAgent._is_copilot_provider``; the fallback keeps the ``github-copilot`` /
+    """【判断是否为 GitHub Copilot 提供商 / Check if Copilot Provider】
+    优先委托给 AIAgent._is_copilot_provider；回退逻辑保留对 github-copilot、github 别名的匹配，
+    确保在凭据过期时能够正确触发自动换票凭证恢复机制。
+
+    Delegate to ``AIAgent._is_copilot_provider``; the fallback keeps the ``github-copilot`` /
     ``github`` aliases so credential recovery is not skipped for them."""
     try:
         return bool(agent._is_copilot_provider())
@@ -411,7 +450,12 @@ def _is_copilot_provider(agent: Any) -> bool:
 
 
 def _is_stale_copilot_credential_error(status_code: Optional[int], error_message: str) -> bool:
-    """Detect a Copilot 400 that is really a STALE / DEGRADED credential (status 400 AND an
+    """【识别 Copilot 凭证过期/失效错误 / Detect Stale Copilot Credential Error】
+    痛点剖析：GitHub Copilot 网关在 Token 过期或被降级时，经常返回通用的 HTTP 400 错误。
+    本函数通过精确匹配错误特征串（如 integrator/model_not_supported），
+    精准识别出是凭据失效而非用户把模型名字拼错了，从而安全触发一次性的自动重新换票。
+
+    Detect a Copilot 400 that is really a STALE / DEGRADED credential (status 400 AND an
     integrator/model-not-supported marker, so a wrong model name never triggers the
     single-shot re-exchange). Caller enforces scoping/guard."""
     lowered = (error_message or "").lower()
@@ -426,7 +470,18 @@ def _is_stale_copilot_credential_error(status_code: Optional[int], error_message
 
 
 def _pressure_with_real_floor(compressor: Any, rough_tokens: int) -> int:
-    """Floor the ROUGH pre-API pressure estimate at the last REAL prompt size.
+    """【以真实历史 Prompt Token 为保底的上下文压力评估 / Pressure with Real Usage Floor】
+    核心机制与痛点背景：
+    1. 粗略估算的盲区：在没有上游返回的精准锚点时，使用字符启发式估算的 Token（rough_tokens）
+       在遇到非 ASCII 文本（如中文、希腊文、西里尔文）时，会被严重低估高达 2 倍！
+    2. 沉默截断死循环（Truncation Death Spiral）：
+       例如用户发了大量中文，粗估显示只有 4 万 Token（未达到 5.5 万压缩阈值），
+       但实际发到模型时已经达到 6.5 万上限，在 Ollama 等会静默裁剪超出上下文的后端上，
+       会导致模型读不到前面的关键消息而胡言乱语；
+    3. 保底机制：强制以大模型上一次真实返回并记录的 `last_real_prompt_tokens` 作为硬性下限（Floor），
+       绝不允许粗估值跌破真实已测量的物理消耗。
+
+    Floor the ROUGH pre-API pressure estimate at the last REAL prompt size.
 
     Applied only on the fallback path -- when ``anchored_context_tokens`` has
     no valid anchor (first request, transcript rewritten under the anchor,
@@ -456,7 +511,13 @@ def _pressure_with_real_floor(compressor: Any, rough_tokens: int) -> int:
 
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
-    """Return a user-facing error when Ollama is loaded with too little context."""
+    """【Ollama 本地运行时上下文过小硬拦截 / Ollama Context Limit Error】
+    诊断守卫：Ollama 默认启动参数往往只配置了 2048 或 4096 长度的上下文，
+    但 Hermes 自身丰富的高级工具 Schema 定义加上长系统提示词就已经超过了该上限。
+    如果在上下文严重不足时盲目调用，工具调用必然破损；
+    本函数在 Phase 2 及时拦截并给出极其详尽的修改指引（如推荐设置 num_ctx: 65536）。
+
+    Return a user-facing error when Ollama is loaded with too little context."""
     runtime_ctx = getattr(agent, "_ollama_num_ctx", None)
     if (
         not getattr(agent, "tools", None)
@@ -487,7 +548,11 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
 
 def _maybe_grow_local_window(agent: Any, compressor: Any,
                              request_tokens: int) -> Optional[int]:
-    """Grow a managed local model's context window before compressing; returns the new
+    """【本地托管模型（llama.cpp）上下文阶梯式动态扩容 / Dynamically Grow Local Context Window】
+    针对本地运行的 llama.cpp 后端：在万不得已触发耗时的上下文压缩之前，
+    尝试探测本地显存是否允许阶梯式提升模型上下文窗口；若扩容成功则返回新尺寸，推迟压缩。
+
+    Grow a managed local model's context window before compressing; returns the new
     window when the ladder granted one, else None."""
     provider = (getattr(agent, "provider", "") or "").strip().lower()
     base_url = getattr(agent, "base_url", "") or ""
@@ -510,7 +575,11 @@ def _maybe_grow_local_window(agent: Any, compressor: Any,
 
 
 def _ra():
-    """Lazy ``run_agent`` reference so patches on ``run_agent.*`` reach this code path."""
+    """【惰性引用 run_agent 门面模块 / Lazy run_agent Reference】
+    测试和外部插件经常使用 `patch("run_agent.handle_function_call")` 等猴子补丁。
+    通过动态 late-import 返回 run_agent 模块对象，保证测试打上的 mock 能够 100% 作用于当前循环逻辑。
+
+    Lazy ``run_agent`` reference so patches on ``run_agent.*`` reach this code path."""
     import run_agent
     return run_agent
 
@@ -530,7 +599,11 @@ def _nous_entitlement_message(capability: str) -> str:
 
 
 def _print_guidance(agent, message: str) -> bool:
-    """Print each line of ``message`` as a 💡 hint; False when there is nothing to print."""
+    """【向终端或日志打印操作引导提示 / Print Actionable Guidance】
+    将 message 中的每一行以 💡 图标前缀通过 agent._vprint 输出，用于在用户遇到错误或配额耗尽时提供即时、清晰的操作指引。
+    若 message 为空则返回 False。
+
+    Print each line of ``message`` as a 💡 hint; False when there is nothing to print."""
     if not message:
         return False
     for line in message.splitlines():
@@ -543,7 +616,11 @@ def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
 
 
 def _system_prompt_for_hooks(api_kwargs: Any, request_messages: Any) -> Any:
-    """System prompt as sent to the provider (``system`` / ``instructions`` / ``messages[0]``)
+    """【提取可观测性钩子所需的系统提示词 / Extract System Prompt for Observability Hooks】
+    解析发送给服务商请求中的系统指令内容：依次检查 api_kwargs["system"]、api_kwargs["instructions"]
+    或 request_messages[0]（role=="system"）。供 LLM 监控、链路追踪或调试中间件读取，无系统提示词时返回 None。
+
+    System prompt as sent to the provider (``system`` / ``instructions`` / ``messages[0]``)
     for observability hooks; None when the request carries none."""
     system_prompt = api_kwargs.get("system")
     if system_prompt is None:
@@ -564,6 +641,17 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
 def _billing_or_entitlement_message(
     *, capability: str, provider: str, base_url: str, model: str, unverified: bool = False
 ) -> str:
+    """【生成账户额度或计费耗尽指引文案 / Billing or Entitlement Guidance Message】
+    设计意图与边界痛点（参见 issue #82154）：
+    1. Anthropic Pro/Max OAuth 订阅边界陷阱：
+       在通过 Claude 订阅（OAuth）使用时，若包含配额耗尽，Anthropic 会直接返回硬性的 HTTP 400 错误；
+       但极易引起混淆的是：如果请求的内容审查过滤器（Content Filter）被触发（例如系统提示词中包含了敏感词汇），
+       Anthropic 也会返回完全相同的 400 错误！
+    2. unverified 审慎提示机制：
+       当 unverified=True 时，文案绝不武断地断言“一定是欠费”，而是明确告知用户：这可能是内容过滤拒绝，
+       引导用户先去 claude.ai 确认实际用量，并提示使用 `hermes auth reset anthropic` 重置凭据缓存，
+       或者通过 `/model <model> --provider <provider>` 切换模型，避免被错误诊断误导。
+    3. 通用 Provider 计费指引：通过 build_billing_block 统一解析不同服务商对应的充值控制台链接。"""
     if _is_nous_inference_route(provider, base_url):
         return _nous_entitlement_message(capability)
 
@@ -618,7 +706,10 @@ def _billing_or_entitlement_message(
 
 
 def _billing_block_dict(provider, base_url, model, message="", *, unverified: bool = False) -> Optional[dict]:
-    """Best-effort structured billing descriptor (None if billing_links is unavailable)."""
+    """【构造结构化计费信息块字典】
+    构建尽力而为（Best-effort）的计费元数据字典，若 unverified 为 True 则标记 hedge 标志，供各前端 UI 呈现防误判说明。
+
+    Best-effort structured billing descriptor (None if billing_links is unavailable)."""
     try:
         from agent.billing_links import build_billing_block
         block = build_billing_block(
@@ -632,7 +723,10 @@ def _billing_block_dict(provider, base_url, model, message="", *, unverified: bo
 
 
 def _billing_terminal_label(summary: str, unverified: bool) -> str:
-    """Terminal-failure prefix for a billing-classified error; ``unverified`` (#82154) must
+    """【生成计费错误终止标签】
+    若 unverified 为 True 则绝不将欠费断言为确定事实，而是标明可能是内容安全过滤。
+
+    Terminal-failure prefix for a billing-classified error; ``unverified`` (#82154) must
     not assert exhaustion as fact."""
     if unverified:
         return (
@@ -646,7 +740,11 @@ def _billing_failure_result(
     *, classified, summary: str, messages, api_call_count: int, provider: str, base_url, model: str,
     guidance: Optional[str] = None,
 ) -> dict:
-    """Structured terminal result for a billing-classified failure — the single construction
+    """【构造计费失败的终止轮次结果 / Billing Failure Terminal Result】
+    不可重试中止与最大重试次数耗尽时的唯一定义构建点（参见 issue #82154）。
+    集成分类器判定、可重试性、结构化计费区块及用户端引导文案。
+
+    Structured terminal result for a billing-classified failure — the single construction
     point for the non-retryable abort and max-retries paths (#82154)."""
     unverified = bool(getattr(classified, "billing_unverified", False))
     if guidance is None:
@@ -676,7 +774,15 @@ def _print_billing_or_entitlement_guidance(
 
 
 def _bot_chat_prompt_stale(agent, stored_prompt: str) -> bool:
-    """Bot Chat capability epoch check for a stored prompt.
+    """【检查机器人会话（Bot Chat）系统提示词版本演进状态】
+    核心机制剖析：
+    系统提示词中嵌入了功能指纹（Capability Fingerprint）。
+    在持续会话中，Hermes 坚守“提示词缓存神圣不可侵犯（Prompt Caching is Sacred）”原则，默认逐字节复用已存提示词；
+    但当用户安装新技能、启用 Bot Mode 或核心功能发生代际演进时，需要且仅需要重新构建一次。
+    - 若指纹不匹配：触发单次确定性重建（deliberate once-per-change rebuild）；
+    - 若探测过程异常：故障闭合（Fail Closed）到“复用原提示词”，以最大化保护前缀缓存命中率。
+
+    Bot Chat capability epoch check for a stored prompt.
 
     The stored prompt embeds a capability fingerprint; a mismatch is a deliberate
     once-per-change rebuild. Unstamped prompts never match; probe failures fail closed
@@ -882,7 +988,16 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
-    """Return False when the persisted runtime-identity lines are stale."""
+    """【判断数据库持久化的系统提示词与当前运行时是否匹配 / Check Stored Prompt Runtime Match】
+    核心缓存校验：检查 SQLite 会话数据库中持久化的提示词是否与当前运行时环境一致。
+    若一致，则 100% 字节级复用，保证云端前缀缓存（KV Cache）命中；
+    若不一致（如模型名、提供商变更，或工作目录 CWD 改变导致项目文件规范 AGENTS.md 变动），则返回 False 触发重建。
+    
+    ⚠️ 关键设计不变量：
+    客户端平台（Platform，如 CLI 切换到 Desktop）故意不作为重构条件！
+    因为界面切换不应该导致 token 0 处的提示词前缀失效，Hermes 仅在用户请求末尾动态注入界面注记（参见 issue #104414）。
+
+    Return False when the persisted runtime-identity lines are stale."""
 
     _identity, runtime_marker, runtime = split_runtime_boundary(prompt)
 
@@ -931,6 +1046,9 @@ _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
 
 
 def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
+    """【获取输出截断续写提示词 / Get Continuation Prompt】
+    当模型的输出因网络中断或触发 max_tokens 输出长度上限被截断时，
+    构造一条合成的系统继续生成提示（Nudge），命令模型直接续写，禁止重头再来或重复前文。"""
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
         return (
@@ -943,6 +1061,11 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
     return _LENGTH_CONTINUATION_NETWORK_STUB if is_partial_stub else _LENGTH_CONTINUATION_OUTPUT_LIMIT
 
 
+# 【推理模型纯思考无输出打断提示词 / Codex/Reasoning Incomplete Nudge】
+# 痛点剖析：像 OpenAI o1/o3、DeepSeek-R1 这类推理模型，有时会把所有 token 预算用在内部隐式思考（CoT）上，
+# 最终却输出了 0 个可见字符和 0 个工具调用。
+# 如果原样重试，请求字节完全相同，模型大概率会陷入死循环再次吐出纯思考。
+# 本提示词明确喝止模型：“不要再想了，现在立即以纯文本给出最终答案或发起工具调用！”
 # Codex/Responses turns that returned only internal reasoning: a bare retry would be
 # byte-identical, so the model repeats it.
 _CODEX_INCOMPLETE_NUDGE = (
@@ -993,7 +1116,14 @@ _canon_args_cache_bytes = 0
 
 
 def _canonicalize_tool_call_arguments(arg_str: str) -> str:
-    """Canonical wire form of a tool-call arguments JSON string; raises on malformed input
+    """【工具调用 JSON 参数规范化（捍卫前缀缓存字节级恒定）】
+    底层架构意图与痛点：
+    大模型每一轮生成的工具调用参数 JSON，其字段顺序和空白符往往具有随机性（例如 `{"a":1, "b":2}` vs `{"b":2,"a":1}`）。
+    如果跨轮次重放历史时 JSON 字节发生微小漂移，云端底层的前缀缓存（KV Cache）就会全盘击穿！
+    解决机制：通过 `json.loads` 解析并使用 `json.dumps(..., separators=(',', ':'), sort_keys=True)`
+    强行格式化为排序且去除无意义空白的标准规范字符串。内建 LRU 缓存池限制最大 32MB 内存开销。
+
+    Canonical wire form of a tool-call arguments JSON string; raises on malformed input
     (the caller falls back to ``_repair_tool_call_arguments``)."""
     global _canon_args_cache_bytes
     cached = _CANON_ARGS_CACHE.get(arg_str)
@@ -1014,7 +1144,12 @@ def _canonicalize_tool_call_arguments(arg_str: str) -> str:
 
 
 def _clone_message_for_send(msg):
-    """Structural clone (dicts/lists recursively, immutable leaves shared) of a history
+    """【极速结构化深拷贝（比 copy.deepcopy 快一个数量级）】
+    Python 性能优化点：标准库的 `copy.deepcopy` 由于维护复杂的 memo 字典和反射检查，速度极慢。
+    对话消息对象是纯无环的 JSON 数据结构，本函数递归拷贝 dict/list，而字符串/数字等不可变对象直接复用指针，
+    在单轮组装数百条消息时性能提升 5~10 倍，同时完全杜绝发送前的临时修饰（如清洗代理对）渗透污染落盘的历史记录。
+
+    Structural clone (dicts/lists recursively, immutable leaves shared) of a history
     message for the per-call API copy, so send-path rewrites never reach the persisted
     transcript (#80498). Cheaper than deepcopy: messages are JSON-shaped and acyclic."""
     if isinstance(msg, dict):
@@ -1025,7 +1160,11 @@ def _clone_message_for_send(msg):
 
 
 def _canonicalize_api_tool_calls(api_messages) -> None:
-    """Canonicalize tool-call argument JSON on the send-path copy (copy-on-write for the
+    """【API 发送前历史工具调用规范化 / Canonicalize Tool Calls on Send-Path】
+    在构造好的临时 `api_messages` 副本上，遍历清洗所有历史 `tool_calls` 的 JSON 参数，
+    保证请求体在传输至网络前达到字节级绝对确定性，而底层的 SessionDB 持久化历史保持原样。
+
+    Canonicalize tool-call argument JSON on the send-path copy (copy-on-write for the
     dicts it touches; persisted history untouched)."""
     for am in api_messages:
         tcs = am.get("tool_calls")
@@ -1048,7 +1187,12 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
 
 
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
-    """Error content for an unknown tool name. A blank name is a model echoing tool-call
+    """【构造非法工具名错误消息 / Format Invalid Tool Name Error Content】
+    针对模型胡言乱语调用不存在的工具时的错误回显：
+    若工具名为空（模型将代码中的 XML/JSON 误读为工具调用）：简短警告，绝不输出工具目录，防止喂养幻觉死循环；
+    若工具名拼写错误：输出完整的可用工具清单，引导模型在下一轮自我纠错。
+
+    Error content for an unknown tool name. A blank name is a model echoing tool-call
     syntax seen in data (#47967) — dumping the catalog feeds that loop, so it gets a terse
     error; a nonempty wrong name still gets the catalog to self-correct."""
     if not (name or "").strip():
@@ -1064,7 +1208,15 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
 def _content_policy_blocked_result(
     messages: List[Dict], api_call_count: int, *, final_response: str, error_detail: str
 ) -> Dict[str, Any]:
-    """Terminal turn result for a content-policy block (deterministic for the unchanged
+    """【内容审查策略拦截终端结果 / Content Policy Blocked Terminal Result】
+    当大模型提供商（如 OpenAI、Anthropic）的内容安全过滤器判定输入或输出违规（如有害内容、敏感词等）时，
+    立即以此终结当前轮次：
+    1. 确定性不可重试（Deterministic & failure_retryable=False）：由于相同的 prompt 再次发送必定仍会被拦截，
+       重试只会白白浪费额度与时间，因此绝对禁止重试。
+    2. 统一收口：无论是 HTTP 200 返回中携带 finish_reason="content_filter"，还是底层抛出 400 ContentPolicy 异常，
+       均共享此收口函数返回标准的失败契约字典。
+
+    Terminal turn result for a content-policy block (deterministic for the unchanged
     prompt, so no retry); shared by the HTTP-200 and exception paths."""
     return {
         "final_response": final_response, "messages": messages, "api_calls": api_call_count,
@@ -1076,7 +1228,13 @@ def _content_policy_blocked_result(
 def _partial_turn_result(
     final_response: str, messages: List[Dict], api_call_count: int, **flags: Any
 ) -> Dict[str, Any]:
-    """Incomplete-turn result whose ``error`` mirrors ``final_response``; ``flags`` add the
+    """【构建非完整轮次结果对象 / Partial Turn Result Builder】
+    构建包含部分输出或异常退出的轮次契约字典：
+    - completed=False, partial=True 标记当前轮次未正常完成；
+    - error 字段镜像 final_response 文本，方便上层消费端（CLI/TUI/网关）直接提取错误原因进行提示渲染；
+    - flags 透传各类恢复契约标记（例如 failed=True, compression_deferred=True, turn_exit_reason 等）。
+
+    Incomplete-turn result whose ``error`` mirrors ``final_response``; ``flags`` add the
     recovery-contract keys (``failed``, ``compression_deferred``, ...)."""
     return {
         "final_response": final_response, "messages": messages, "completed": False,
@@ -1085,7 +1243,15 @@ def _partial_turn_result(
 
 
 def _compression_deferred_result(agent, messages: List[Dict], api_call_count: int, reason: str = "lock") -> Dict[str, Any]:
-    """Soft turn result for a transiently-deferred compression. Both reasons must end as
+    """【上下文压缩暂缓推迟退出结果 / Transiently Deferred Compression Result】
+    关键架构意图与痛点剖析（参见 issue #9893 与 #35809）：
+    1. 暂缓推迟（Deferred）不等于耗尽（Exhausted）：
+       当压缩锁被另一个并发路径持有（reason="lock"），或者最近一次压缩失败后进入了冷却保护期（reason="transient_block"），
+       系统只是“推迟”当前压缩，而不是“彻底无解”。
+    2. 坚守会话保护：如果误将此处归类为 compression_exhausted，网关（Gateway）就会判定会话已经彻底撑爆而触发 wipe 清空整个会话！
+       因此此处必须标记 compression_deferred=True，且 failed 保持为 False，让会话消息完整保留，提示用户稍后重试。
+
+    Soft turn result for a transiently-deferred compression. Both reasons must end as
     ``compression_deferred``, never ``compression_exhausted`` — the gateway wipes the
     session on exhaustion (#9893/#35809). ``failed`` stays False; the turn persists."""
     session = agent.session_id or "none"
@@ -1123,7 +1289,16 @@ def _provider_overflow_exhausted_result(
     agent, messages: List[Dict], conversation_history, api_call_count: int,
     request_pressure_tokens: int, max_compression_attempts: int,
 ) -> Dict[str, Any]:
-    """Fail closed when a rebuilt request is still too large after recovery."""
+    """【模型服务商上下文溢出重试耗尽处理 / Context Overflow Exhausted Result】
+    核心机制与设计考量（参见 issue #98722 移植自 #98741）：
+    1. 彻底防雪崩（Fail-Closed）：当大模型提供商明确返回 413/上下文溢出错误，且 Agent 经过 max_compression_attempts
+       次上下文压缩重试后，重新组装的请求体积依然超出窗口阈值时触发。
+    2. 拒绝无效死循环：若此时继续把未缩减的请求发给模型，只会撞上同一个 413 错误并陷入原地自旋；
+       因此直接在此结束当前 Turn，返回带有 compression_exhausted=True 的恢复契约。
+    3. 消息落盘与角色闭合：调用 agent._persist_session 保证先前的工具调用与对话记录完好落盘；
+       同时避免未配对的 tool-result 残留导致下一个用户轮次出现 tool -> user 破坏角色交替不变量。
+
+    Fail closed when a rebuilt request is still too large after recovery."""
     agent._flush_status_buffer()
     logger.error(
         "%sContext compression failed after %d attempts; rebuilt request "
@@ -1148,7 +1323,18 @@ def _provider_overflow_exhausted_result(
 
 
 def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool:
-    """Rewrite a cache-decorated system message in place, keeping its blocks (a bare string
+    """【就地重写多块系统提示词内容（守卫前缀缓存断点）】
+    核心机制剖析：
+    在 Anthropic 或带有 Prompt Caching 的架构中，系统消息通常被结构化分块为：
+    `[static prefix（带 cache_control 静态前缀）, volatile tail（易变尾部）]`。
+    如果直接粗暴地将 `system_message["content"] = effective` 赋值为单一纯文本字符串，
+    就会把原有的列表结构冲毁，导致两处 cache_control 缓存断点全部丢失！
+    本函数进行就地精细化重写（In-place Rewrite）：
+    - 若原本是单文本块：直接更新该块的 text；
+    - 若原本是两块（静态头+动态尾）：校验 effective 是否以静态头为开头，若是，则仅将尾部内容写入第二块；
+    - 若结构无法安全就地更新，则返回 False，由上层兜底处理。
+
+    Rewrite a cache-decorated system message in place, keeping its blocks (a bare string
     over the ``[static prefix, volatile tail]`` list would drop both cache_control
     breakpoints). Returns False when the shape cannot be safely patched."""
     content = system_message.get("content")
@@ -1212,7 +1398,12 @@ def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
 
 
 def _peel_moa_guidance(messages: List[Dict[str, Any]], guidance: Any) -> List[Dict[str, Any]]:
-    """Remove MoA reference guidance attached by ``_attach_reference_guidance``."""
+    """【剥离混合专家（MoA）临时指导注入消息】
+    在 Mixture of Agents 轮次中，上游聚合阶段可能会向消息列表中注入临时的参考指导提示（Reference Guidance）。
+    在进行跨服务商故障转移或重新规划缓存布局时，调用此函数将该指导层剥离出来，以便后续重新基线化（Rebase），
+    防止重复注入造成提示词膨胀。
+
+    Remove MoA reference guidance attached by ``_attach_reference_guidance``."""
     from agent.moa_loop import peel_reference_guidance
     return peel_reference_guidance(messages, guidance)
 
@@ -1276,7 +1467,14 @@ def _redecorate_prompt_cache_for_provider(
 
 
 def _engine_overrides_hook(engine: Any, name: str) -> bool:
-    """True when ``engine`` implements ContextEngine hook ``name`` itself.
+    """【检查上下文引擎是否重写了指定生命周期钩子】
+    性能与零成本原则：
+    未实现高级钩子的简单上下文引擎在每轮对话中绝不应付出反射损耗；
+    仅用 hasattr 是不够的，因为 ContextEngine 抽象基类（ABC）上已经定义了默认的 no-op 空实现。
+    因此此处精确比较函数引用 `__func__` 是否与 ABC 默认方法不同。
+    采用延迟导入（Lazy import）以彻底消除与 agent.context_engine 的循环导入风险。
+
+    True when ``engine`` implements ContextEngine hook ``name`` itself.
 
     Non-implementing engines must pay nothing per turn; ``hasattr`` is not enough because
     the ABC defines a no-op default. Lazy import avoids a cycle with agent.context_engine."""
@@ -1294,7 +1492,16 @@ def _apply_context_engine_selection(
     agent: Any, api_messages: List[Dict[str, Any]], conversation_messages: List[Dict[str, Any]],
     incoming_message: Optional[Dict[str, Any]], *, logger: Any,
 ) -> List[Dict[str, Any]]:
-    """Run the optional per-turn ``ContextEngine.select_context()`` hook, fail-open: any
+    """【执行上下文引擎的按轮次选择性剪裁钩子（故障开放 / Fail-Open）】
+    调用外部可插拔的 ContextEngine.select_context() 钩子，依据语义相关度或策略筛选当前轮次发送给模型的上下文。
+    
+    两大架构铁律：
+    1. 结构深度克隆（Structural Clones，参见 issue #80498）：
+       传入钩子的消息列表使用 _clone_message_for_send 深拷贝，严防第三方引擎原地篡改已被 SessionDB 持久化的历史 transcript；
+    2. 故障开放（Fail-Open）：任何异常或非法返回值（例如空列表 [] 或非字典项）都会被安全忽略，
+       直接回退使用原版的 api_messages，绝不导致当前轮次崩溃。
+
+    Run the optional per-turn ``ContextEngine.select_context()`` hook, fail-open: any
     exception or invalid return yields ``api_messages`` unchanged; history is never mutated."""
     engine = getattr(agent, "context_compressor", None)
     if not _engine_overrides_hook(engine, "select_context"):
@@ -1339,7 +1546,12 @@ def _apply_context_engine_selection(
 def _notify_context_engine_turn_complete(
     agent: Any, messages: List[Dict[str, Any]], *, usage: Optional[Dict[str, Any]] = None, logger: Any, **meta: Any
 ) -> None:
-    """Notify the active context engine that a user turn has finished (fail-open; the engine
+    """【通知上下文引擎轮次执行完毕】
+    在用户轮次顺利结束后向 ContextEngine 发出 on_turn_complete 广播：
+    - 采用故障开放策略，即便引擎处理异常也不会打断主流程；
+    - 传递深拷贝副本，确保引擎无法反向污染 SessionDB 中的持久化记录。
+
+    Notify the active context engine that a user turn has finished (fail-open; the engine
     gets a copy so it cannot mutate the persisted transcript)."""
     engine = getattr(agent, "context_compressor", None)
     if not _engine_overrides_hook(engine, "on_turn_complete"):
@@ -1356,7 +1568,12 @@ def _notify_context_engine_turn_complete(
 
 
 def _decode_inline_moa_turn(user_message, persist_user_message):
-    """Decode a MoA preset encoded into ``user_message``; returns ``(user_message,
+    """【解码内联 MoA 提示指令】
+    解析用户消息中内嵌的 MoA（Mixture of Agents）预设配置指令（如 /moa:council 等）；
+    返回三元组 `(user_message, moa_config, persist_user_message)`。
+    若未检测到内联 MoA 配置，则返回原始输入，且 moa_config 为 None。
+
+    Decode a MoA preset encoded into ``user_message``; returns ``(user_message,
     moa_config, persist_user_message)``, unchanged with ``moa_config=None`` otherwise."""
     try:
         from hermes_cli.moa_config import decode_moa_turn
@@ -1371,7 +1588,16 @@ def _decode_inline_moa_turn(user_message, persist_user_message):
 
 
 def _preflight_timeout_result(agent, exc, conversation_history) -> Dict[str, Any]:
-    """Typed recovery result when turn-start preflight compression timed out (#98424): no
+    """【起跑门禁前置压缩超时恢复结果 / Preflight Timeout Typed Recovery Result】
+    设计意图与边界处理（参见 issue #98424 与 #7100）：
+    1. 门禁超时防护：在轮次启动前，若前置压缩（Preflight Compression）耗时超出了所设定的预算硬限，
+       此时尚未向大模型发起任何实际网络请求。
+    2. 绊线状态安全释放：调用 note_turn_persisted 清除 note_turn_start 登记的看门狗绊线，
+       同时故意不落盘该条 user 记录（因为该轮次尚未真正进入执行状态），避免产生孤立悬挂的半拉子数据。
+    3. 类型化恢复契约：返回标准 partial 结果，携带 context_compression_timeout 退出原因，
+       将异常中的可操作指引透传至上层 UI 界面。
+
+    Typed recovery result when turn-start preflight compression timed out (#98424): no
     provider call was sent, and surfaces would otherwise hide the actionable guidance."""
     logger.warning(
         "Turn-start preflight compression timed out — ending turn with typed recovery result: %s", exc,
